@@ -28,8 +28,7 @@ for ARCH in arm64 x86_64; do
     -framework SwiftUI \
     -framework Combine \
     -framework UserNotifications \
-    -framework ServiceManagement \
-    -framework IOKit
+    -framework ServiceManagement
 done
 lipo -create -output build/AutoAgentStatus build/AutoAgentStatus-arm64 build/AutoAgentStatus-x86_64
 

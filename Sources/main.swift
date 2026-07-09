@@ -1,7 +1,6 @@
 import AppKit
 import Combine
 import Foundation
-import IOKit.pwr_mgt
 import ServiceManagement
 import SwiftUI
 import UserNotifications
@@ -297,27 +296,125 @@ struct DayUsage: Identifiable {
     var id: Date { date }
 }
 
-/// Single scan of today's + the last `days` days of Claude transcripts. Returns
-/// today's full breakdown plus a per-day billable/cost history (oldest first).
-func readUsageReport(days: Int = 7) -> (today: TokenUsage, history: [DayUsage]) {
+/// Cumulative billable-token / cost totals over wider windows than "today".
+struct PeriodTotals {
+    var weekBillable = 0
+    var weekCost = 0.0
+    var monthBillable = 0
+    var monthCost = 0.0
+    var allBillable = 0
+    var allCost = 0.0
+}
+
+// Per-file usage aggregate, persisted so unchanged transcripts (the bulk of the
+// ~GB on disk) are parsed once and skipped on later scans — only files whose
+// mtime/size changed are re-read. `monthly` (keyed "YYYY-MM") feeds month/all-
+// time and survives a calendar rollover; `daily` (keyed "YYYY-MM-DD", kept only
+// for the recent window) feeds today's breakdown and the 7-day chart, recomputed
+// against the current date so a day-old cache still maps to the right bucket.
+struct MonthAgg: Codable { var billable: Int = 0; var cost: Double = 0 }
+/// Per-model token split for one day — mirrors the CLI's per-model breakdown
+/// so the app can report it to the server (adding this field invalidates any
+/// older on-disk cache once, triggering a single full rescan on first launch).
+struct ModelAgg: Codable { var input = 0, output = 0, cacheCreate = 0, cacheRead = 0 }
+struct DayAgg: Codable {
+    var input = 0, output = 0, cacheCreate = 0, cacheRead = 0
+    var cost: Double = 0
+    var models: [String: ModelAgg] = [:]
+}
+struct FileAgg: Codable {
+    var mtime: Double
+    var size: Int
+    var monthly: [String: MonthAgg]
+    var daily: [String: DayAgg]
+}
+
+private func usageCacheURL() -> URL? {
+    let fm = FileManager.default
+    guard let base = fm.urls(for: .cachesDirectory, in: .userDomainMask).first else { return nil }
+    let dir = base.appendingPathComponent("AutoAgentStatus", isDirectory: true)
+    try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir.appendingPathComponent("usage-cache.json")
+}
+private func loadUsageCache() -> [String: FileAgg] {
+    guard let url = usageCacheURL(), let data = try? Data(contentsOf: url),
+          let c = try? JSONDecoder().decode([String: FileAgg].self, from: data) else { return [:] }
+    return c
+}
+private func saveUsageCache(_ c: [String: FileAgg]) {
+    guard let url = usageCacheURL(), let data = try? JSONEncoder().encode(c) else { return }
+    try? data.write(to: url)
+}
+
+/// Single scan of the Claude transcripts. Returns today's full breakdown, a
+/// per-day billable/cost history for the last `days` days (oldest first), and
+/// cumulative totals for this week / this calendar month / all-time.
+///
+/// The month/all-time totals need every transcript, but ~GB of those never
+/// change. We persist a per-file aggregate keyed by path + mtime + size and only
+/// re-read files whose mtime/size moved — so steady-state scans read just the
+/// few active sessions, and everything else comes from the cache.
+func readUsageReport(days: Int = 7) -> (today: TokenUsage, history: [DayUsage], totals: PeriodTotals, todayModels: [String: ModelAgg]) {
     var today = TokenUsage()
+    var todayModels: [String: ModelAgg] = [:]
+    var totals = PeriodTotals()
     var buckets = Array(repeating: (tokens: 0, cost: 0.0), count: days) // index 0 = today
     let fm = FileManager.default
     let cal = Calendar.current
     let startToday = cal.startOfDay(for: Date())
+    func ymKey(_ day: Date) -> String {
+        let c = cal.dateComponents([.year, .month], from: day)
+        return String(format: "%04d-%02d", c.year ?? 0, c.month ?? 0)
+    }
+    func dmyKey(_ day: Date) -> String {
+        let c = cal.dateComponents([.year, .month, .day], from: day)
+        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+    }
+    func daysAgoOf(dayKey: String) -> Int? {
+        let p = dayKey.split(separator: "-").compactMap { Int($0) }
+        guard p.count == 3 else { return nil }
+        var c = DateComponents(); c.year = p[0]; c.month = p[1]; c.day = p[2]
+        guard let day = cal.date(from: c) else { return nil }
+        return cal.dateComponents([.day], from: cal.startOfDay(for: day), to: startToday).day
+    }
+    let curYM = ymKey(startToday)
 
     var configDirs = ["\(home)/.claude"]
     if let cfg = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"] {
         configDirs.append(cfg)
     }
 
-    // Skip files untouched before the window we care about.
-    let cutoff = startToday.addingTimeInterval(-Double(days) * 86400 - 26 * 3600)
     let isoFrac = ISO8601DateFormatter()
     isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     let iso = ISO8601DateFormatter()
 
-    var seen = Set<String>()
+    let cache = loadUsageCache()
+    var freshCache: [String: FileAgg] = [:]
+
+    // Fold one file's cached aggregate into the running totals/buckets.
+    func fold(_ agg: FileAgg) {
+        for (ym, m) in agg.monthly {
+            totals.allBillable += m.billable; totals.allCost += m.cost
+            if ym == curYM { totals.monthBillable += m.billable; totals.monthCost += m.cost }
+        }
+        for (dk, a) in agg.daily {
+            guard let ago = daysAgoOf(dayKey: dk), ago >= 0 && ago < days else { continue }
+            buckets[ago].tokens += a.input + a.output + a.cacheCreate
+            buckets[ago].cost += a.cost
+            if ago == 0 {
+                today.input += a.input; today.output += a.output
+                today.cacheCreate += a.cacheCreate; today.cacheRead += a.cacheRead
+                today.costUSD += a.cost
+                for (m, ma) in a.models {
+                    var t = todayModels[m] ?? ModelAgg()
+                    t.input += ma.input; t.output += ma.output
+                    t.cacheCreate += ma.cacheCreate; t.cacheRead += ma.cacheRead
+                    todayModels[m] = t
+                }
+            }
+        }
+    }
+
     for dir in configDirs {
         let projects = dir + "/projects"
         guard let en = fm.enumerator(atPath: projects) else { continue }
@@ -325,9 +422,24 @@ func readUsageReport(days: Int = 7) -> (today: TokenUsage, history: [DayUsage]) 
             guard rel.hasSuffix(".jsonl") else { continue }
             let path = projects + "/" + rel
             guard let attrs = try? fm.attributesOfItem(atPath: path),
-                  let mtime = attrs[.modificationDate] as? Date, mtime >= cutoff,
-                  let data = fm.contents(atPath: path),
+                  let mtime = attrs[.modificationDate] as? Date else { continue }
+            let size = (attrs[.size] as? Int) ?? 0
+
+            // Unchanged file → reuse the cached aggregate, no read.
+            if let agg = cache[path],
+               agg.mtime == mtime.timeIntervalSince1970, agg.size == size {
+                freshCache[path] = agg
+                fold(agg)
+                continue
+            }
+
+            guard let data = fm.contents(atPath: path),
                   let text = String(data: data, encoding: .utf8) else { continue }
+
+            var fileMonthly: [String: MonthAgg] = [:]
+            var fileDaily: [String: DayAgg] = [:]
+            var fileSeen = Set<String>() // dedup within this file
+
             for line in text.split(separator: "\n") {
                 guard line.contains("\"usage\""),
                       let d = line.data(using: .utf8),
@@ -335,41 +447,218 @@ func readUsageReport(days: Int = 7) -> (today: TokenUsage, history: [DayUsage]) 
                       let msg = obj["message"] as? [String: Any],
                       let usage = msg["usage"] as? [String: Any] else { continue }
                 // Which day does this entry belong to? (no timestamp → treat as today)
-                var daysAgo = 0
+                var entryDay = startToday
                 if let ts = obj["timestamp"] as? String {
                     guard let date = isoFrac.date(from: ts) ?? iso.date(from: ts) else { continue }
-                    daysAgo = cal.dateComponents([.day], from: cal.startOfDay(for: date), to: startToday).day ?? 999
+                    entryDay = cal.startOfDay(for: date)
                 }
-                guard daysAgo >= 0 && daysAgo < days else { continue }
+                let daysAgo = cal.dateComponents([.day], from: entryDay, to: startToday).day ?? 999
+                if daysAgo < 0 { continue } // future-dated entry — ignore
+
                 if let mid = msg["id"] as? String {
                     let key = mid + "\u{0}" + ((obj["requestId"] as? String) ?? "")
-                    if seen.contains(key) { continue }
-                    seen.insert(key)
+                    if fileSeen.contains(key) { continue }
+                    fileSeen.insert(key)
                 }
+
                 let inp = usage["input_tokens"] as? Int ?? 0
                 let out = usage["output_tokens"] as? Int ?? 0
                 let cc = usage["cache_creation_input_tokens"] as? Int ?? 0
                 let cr = usage["cache_read_input_tokens"] as? Int ?? 0
+                let model = (msg["model"] as? String) ?? "unknown"
                 var cost = 0.0
-                if let model = msg["model"] as? String, let pr = pricing(for: model) {
+                if let pr = pricing(for: model) {
                     cost = Double(inp) * pr.input + Double(out) * pr.output
                         + Double(cc) * pr.cacheWrite + Double(cr) * pr.cacheRead
                 }
-                buckets[daysAgo].tokens += inp + out + cc
-                buckets[daysAgo].cost += cost
-                if daysAgo == 0 {
-                    today.input += inp; today.output += out
-                    today.cacheCreate += cc; today.cacheRead += cr
-                    today.costUSD += cost
+
+                let ym = ymKey(entryDay)
+                fileMonthly[ym, default: MonthAgg()].billable += inp + out + cc
+                fileMonthly[ym, default: MonthAgg()].cost += cost
+                // Keep per-day detail only for the recent window (bounds cache size;
+                // aging only pushes entries further out, never back in).
+                if daysAgo < days {
+                    let dk = dmyKey(entryDay)
+                    var day = fileDaily[dk] ?? DayAgg()
+                    day.input += inp; day.output += out
+                    day.cacheCreate += cc; day.cacheRead += cr; day.cost += cost
+                    var ma = day.models[model] ?? ModelAgg()
+                    ma.input += inp; ma.output += out
+                    ma.cacheCreate += cc; ma.cacheRead += cr
+                    day.models[model] = ma
+                    fileDaily[dk] = day
                 }
             }
+
+            let agg = FileAgg(mtime: mtime.timeIntervalSince1970, size: size,
+                              monthly: fileMonthly, daily: fileDaily)
+            freshCache[path] = agg
+            fold(agg)
         }
     }
+
+    saveUsageCache(freshCache)
+
+    for b in buckets { totals.weekBillable += b.tokens; totals.weekCost += b.cost }
     let history = (0..<days).reversed().map { i in
         DayUsage(date: cal.date(byAdding: .day, value: -i, to: startToday) ?? startToday,
                  billable: buckets[i].tokens, costUSD: buckets[i].cost)
     }
-    return (today, history)
+    return (today, history, totals, todayModels)
+}
+
+// MARK: - Usage report upload (POST /api/v1/usage/me)
+//
+// The CLI reports today's Claude Code token usage to the server every 5 minutes
+// — but only from its *interactive* foreground session (`Ka()` → `/usage/me`).
+// The detached `__watch` process the app launches never uploads it, so relying
+// on the app alone left the server with no report. We reproduce that upload
+// natively: same payload, same 5-minute cadence (driven by `refreshUsage`).
+//
+// Auth uses the server session token the CLI stores in ~/.auto-agent-ai/
+// .config.json (`auth.accessToken`), which the running watcher keeps refreshed.
+// This is client-only — the owner role uses a different, watcher-driven endpoint
+// (/usage/by-token/claude-usage) that we don't touch.
+
+/// The auto-agent-ai server session access token, if present.
+func readAgentAuthToken() -> String? {
+    guard let d = FileManager.default.contents(atPath: "\(agentHome)/.config.json"),
+          let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+          let auth = obj["auth"] as? [String: Any],
+          let tok = auth["accessToken"] as? String, !tok.isEmpty else { return nil }
+    return tok
+}
+
+/// Claude Code's configured effort level (`~/.claude/settings.json`), if any.
+func readClaudeEffortLevel() -> String? {
+    guard let d = FileManager.default.contents(atPath: "\(home)/.claude/settings.json"),
+          let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+          let e = obj["effortLevel"] as? String else { return nil }
+    return e
+}
+
+/// Today's date in the server's timezone (Asia/Ho_Chi_Minh), matching the CLI.
+private func reportDateString() -> String {
+    let df = DateFormatter()
+    df.locale = Locale(identifier: "en_US_POSIX")
+    df.timeZone = TimeZone(identifier: "Asia/Ho_Chi_Minh")
+    df.dateFormat = "yyyy-MM-dd"
+    return df.string(from: Date())
+}
+
+/// POST today's usage to the server. No-op for the owner role (uses a different
+/// endpoint) or when logged out / no auth token. On 401 we simply skip — the
+/// watcher refreshes the stored token within ~30s, so the next cycle succeeds;
+/// we deliberately don't rewrite the CLI's .config.json to avoid racing its
+/// refresh-token rotation. Best-effort and silent, like the CLI's uploader.
+func pushUsageReport(server: String, role: String?, today: TokenUsage,
+                     models: [String: ModelAgg]) {
+    guard let role, role != "owner" else { return }
+    guard let token = readAgentAuthToken() else { return }
+    let base = server.hasSuffix("/") ? String(server.dropLast()) : server
+    guard let url = URL(string: "\(base)/api/v1/usage/me") else { return }
+
+    let modelsPayload: [[String: Any]] = models.map { name, m in
+        ["model": name, "inputTokens": m.input, "outputTokens": m.output,
+         "cacheReadTokens": m.cacheRead, "cacheCreationTokens": m.cacheCreate]
+    }
+    let body: [String: Any] = [
+        "date": reportDateString(),
+        "inputTokens": today.input,
+        "outputTokens": today.output,
+        "cacheCreationTokens": today.cacheCreate,
+        "effortLevel": readClaudeEffortLevel() ?? NSNull(),
+        "models": modelsPayload,
+    ]
+    guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
+
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.timeoutInterval = 12
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    // Mirror the CLI's X-Client-Version (its own package version) so any
+    // server-side min-version gating treats us the same as the CLI.
+    req.setValue(installedCLIVersion() ?? appVersion, forHTTPHeaderField: "X-Client-Version")
+    req.httpBody = data
+
+    let sem = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: req) { _, _, _ in sem.signal() }.resume()
+    _ = sem.wait(timeout: .now() + 14)
+}
+
+// MARK: - Plan usage (subscription rate limits — the same session/weekly
+// percentages Claude Code's /usage screen shows, from the OAuth usage endpoint)
+
+/// One rate-limit window: how much of the allowance is used (0–100) and when it
+/// resets. `severity` mirrors the API ("normal"/"warning"/"reached"…).
+struct PlanLimit: Identifiable {
+    let label: String
+    let percent: Double
+    let resetsAt: Date?
+    let severity: String
+    var id: String { label }
+    var color: Color {
+        if percent >= 100 || severity == "reached" { return .red }
+        if percent >= 80 || severity == "warning" { return .orange }
+        return .green
+    }
+}
+
+struct PlanUsage {
+    var limits: [PlanLimit] = []
+}
+
+/// The Claude Code OAuth access token from the login Keychain item, if present.
+func readOAuthAccessToken() -> String? {
+    let secret = runCommand("/usr/bin/security",
+                            ["find-generic-password", "-s", keychainService, "-w"], timeout: 5)
+    guard secret.code == 0, let d = secret.output.data(using: .utf8),
+          let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+          let oauth = obj["claudeAiOauth"] as? [String: Any],
+          let tok = oauth["accessToken"] as? String, !tok.isEmpty else { return nil }
+    return tok
+}
+
+/// Fetch the subscription session/weekly usage from Anthropic's OAuth usage
+/// endpoint. Read-only; does not consume message quota. Returns nil on any
+/// failure (no token, offline, non-2xx) so the card just hides itself.
+func fetchPlanUsage() -> PlanUsage? {
+    guard let tok = readOAuthAccessToken(),
+          let url = URL(string: "https://api.anthropic.com/api/oauth/usage") else { return nil }
+    var req = URLRequest(url: url)
+    req.timeoutInterval = 12
+    req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
+    req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+
+    var result: PlanUsage?
+    let sem = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: req) { data, resp, _ in
+        defer { sem.signal() }
+        guard let data, (resp as? HTTPURLResponse)?.statusCode == 200,
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+        let isoFrac = ISO8601DateFormatter()
+        isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let iso = ISO8601DateFormatter()
+        func date(_ v: Any?) -> Date? {
+            guard let s = v as? String else { return nil }
+            return isoFrac.date(from: s) ?? iso.date(from: s)
+        }
+        func window(_ key: String, _ label: String) -> PlanLimit? {
+            guard let o = obj[key] as? [String: Any],
+                  let u = (o["utilization"] as? NSNumber)?.doubleValue else { return nil }
+            return PlanLimit(label: label, percent: u, resetsAt: date(o["resets_at"]),
+                             severity: (o["severity"] as? String) ?? "normal")
+        }
+        var limits: [PlanLimit] = []
+        if let s = window("five_hour", "Session") { limits.append(s) }
+        if let w = window("seven_day", "Week (all models)") { limits.append(w) }
+        if let opus = window("seven_day_opus", "Week · Opus") { limits.append(opus) }
+        guard !limits.isEmpty else { return }
+        result = PlanUsage(limits: limits)
+    }.resume()
+    _ = sem.wait(timeout: .now() + 14)
+    return result
 }
 
 /// Notification categories the user can mute individually (default: on).
@@ -526,33 +815,43 @@ func readStatus() -> AgentStatus {
     return s
 }
 
-// MARK: - Keep-awake (IOKit power assertion — prevents idle system sleep)
+// MARK: - Keep-awake (runs `caffeinate` — mirrors the proven `live` shell alias)
 
-/// Holds a `PreventUserIdleSystemSleep` assertion so the Mac won't fall asleep.
-/// The display may still dim/sleep; the system stays running. Released
-/// automatically by the OS when the process exits.
+/// Keeps the Mac awake by launching `caffeinate -dimsu`, exactly like the
+/// shell `live` function. The bare `PreventUserIdleSystemSleep` IOKit assertion
+/// we used before only covered idle *system* sleep (equivalent to `caffeinate
+/// -i`), so the display and the system itself could still sleep — which is why
+/// it didn't reliably keep the Mac up. Flags here match the alias:
+///   -d prevent display sleep   -i prevent idle system sleep
+///   -m prevent disk idle sleep -s prevent system sleep (on AC)
+///   -u declare the user active
+/// `-w <appPID>` ties caffeinate's lifetime to this app: if the app crashes
+/// without calling `stop()`, caffeinate exits too and never orphans.
 final class SleepGuard {
-    private var assertionID = IOPMAssertionID(0)
+    private var proc: Process?
     private(set) var active = false
 
     func start(reason: String) {
         guard !active else { return }
-        var id = IOPMAssertionID(0)
-        let result = IOPMAssertionCreateWithName(
-            kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
-            IOPMAssertionLevel(kIOPMAssertionLevelOn),
-            reason as CFString,
-            &id)
-        if result == kIOReturnSuccess {
-            assertionID = id
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
+        p.arguments = ["-dimsu", "-w", String(ProcessInfo.processInfo.processIdentifier)]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do {
+            try p.run()
+            proc = p
             active = true
+        } catch {
+            proc = nil
+            active = false
         }
     }
 
     func stop() {
         guard active else { return }
-        IOPMAssertionRelease(assertionID)
-        assertionID = IOPMAssertionID(0)
+        proc?.terminate()
+        proc = nil
         active = false
     }
 }
@@ -571,6 +870,8 @@ final class StatusStore: ObservableObject {
     @Published var autoUpdateCLI = UserDefaults.standard.object(forKey: "autoUpdateCLI") as? Bool ?? true
     @Published var usage: TokenUsage?
     @Published var usageHistory: [DayUsage] = []
+    @Published var usageTotals: PeriodTotals?
+    @Published var planUsage: PlanUsage?
     // Per-category notification mutes (default on).
     @Published var notifyWatcher = NotifKind.watcher.enabled
     @Published var notifyCredential = NotifKind.credential.enabled
@@ -601,6 +902,7 @@ final class StatusStore: ObservableObject {
     private let usageQueue = DispatchQueue(label: "auto-agent-status.usage", qos: .utility)
     private var lastVersionCheck = Date.distantPast
     private var lastUsageScan = Date.distantPast
+    private var lastPlanFetch = Date.distantPast
     private var hasStatus = false
     private var lastUserAction = Date.distantPast
     private var lastAutoRestartAt = Date.distantPast
@@ -747,6 +1049,7 @@ final class StatusStore: ObservableObject {
         }
         checkVersions()
         refreshUsage()
+        refreshPlanUsage()
     }
 
     /// Scan today's Claude transcripts (at most every 5 min — it reads files).
@@ -758,7 +1061,28 @@ final class StatusStore: ObservableObject {
             DispatchQueue.main.async {
                 self.usage = report.today
                 self.usageHistory = report.history
+                self.usageTotals = report.totals
+                // Report today's usage to the server (same payload + 5-min
+                // cadence the CLI uses). Read role/server on main, upload on
+                // the background usage queue.
+                let role = self.status.role
+                let server = self.status.serverUrl ?? defaultServer
+                self.usageQueue.async {
+                    pushUsageReport(server: server, role: role,
+                                    today: report.today, models: report.todayModels)
+                }
             }
+        }
+    }
+
+    /// Fetch the subscription session/weekly usage (at most every 5 min — it's a
+    /// network call). Leaves the last good value in place on a transient failure.
+    func refreshPlanUsage(force: Bool = false) {
+        guard force || Date().timeIntervalSince(lastPlanFetch) > 300 else { return }
+        lastPlanFetch = Date()
+        usageQueue.async {
+            guard let plan = fetchPlanUsage() else { return }
+            DispatchQueue.main.async { self.planUsage = plan }
         }
     }
 
@@ -1077,14 +1401,15 @@ struct Card<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 6) {
             Label(title, systemImage: icon)
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .textCase(.uppercase)
             content
         }
-        .padding(10)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
@@ -1131,7 +1456,7 @@ struct ContentView: View {
     @State private var tab: Tab = .status
     @State private var notifExpanded = false
 
-    enum Tab: Hashable { case status, settings }
+    enum Tab: Hashable { case status, system, settings }
 
     private static let relFormatter = RelativeDateTimeFormatter()
     private static let absFormatter: DateFormatter = {
@@ -1150,7 +1475,11 @@ struct ContentView: View {
             tabPicker
             banners
             Group {
-                if tab == .status { statusTab } else { settingsTab }
+                switch tab {
+                case .status: statusTab
+                case .system: systemTab
+                case .settings: settingsTab
+                }
             }
             Divider()
             bottomBar
@@ -1188,14 +1517,23 @@ struct ContentView: View {
     }
 
     private var statusTab: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 8) {
             credentialCard
+            planCard
             usageCard
-            watcherCard
-            healthCard
             actionsSection
         }
-        .padding(12)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+    }
+
+    private var systemTab: some View {
+        VStack(spacing: 8) {
+            watcherCard
+            healthCard
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
     }
 
     private var settingsTab: some View {
@@ -1223,32 +1561,47 @@ struct ContentView: View {
                 subtitle: "Launch automatically on sign-in",
                 isOn: Binding(get: { store.launchAtLogin }, set: { store.setLaunchAtLogin($0) }))
             notificationsSection
+            AboutSection(store: store)
+                .padding(.top, 4)
         }
         .padding(12)
     }
 
     private var notificationsSection: some View {
-        DisclosureGroup(isExpanded: $notifExpanded) {
-            VStack(spacing: 2) {
-                ForEach(NotifKind.allCases, id: \.self) { kind in
-                    notifRow(kind)
+        VStack(spacing: 2) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { notifExpanded.toggle() }
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "bell.badge.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.pink)
+                        .frame(width: 26, height: 26)
+                        .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.pink.opacity(0.16)))
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Notifications").font(.callout.weight(.medium))
+                        Text("Choose which alerts to show").font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(notifExpanded ? 90 : 0))
                 }
+                .contentShape(Rectangle())
             }
-            .padding(.top, 6)
-        } label: {
-            HStack(spacing: 10) {
-                Image(systemName: "bell.badge.fill")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(Color.pink)
-                    .frame(width: 26, height: 26)
-                    .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.pink.opacity(0.16)))
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Notifications").font(.callout.weight(.medium))
-                    Text("Choose which alerts to show").font(.caption2).foregroundStyle(.secondary)
+            .buttonStyle(.plain)
+
+            if notifExpanded {
+                VStack(spacing: 2) {
+                    ForEach(NotifKind.allCases, id: \.self) { kind in
+                        notifRow(kind)
+                    }
                 }
+                .padding(.top, 6)
+                .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
-        .tint(.secondary)
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
     }
@@ -1279,6 +1632,7 @@ struct ContentView: View {
                 store.refresh()
                 store.checkVersions(force: true)
                 store.refreshUsage(force: true)
+                store.refreshPlanUsage(force: true)
             }
             footerButton("doc.text", help: "Open watch log") { store.openLog() }
             Spacer()
@@ -1405,15 +1759,72 @@ struct ContentView: View {
         }
     }
 
+    /// "Resets 12:50pm" today, otherwise "Resets Jun 24, 10pm" — local time.
+    private func resetText(_ date: Date?) -> String {
+        guard let date else { return "" }
+        let cal = Calendar.current
+        let f = DateFormatter()
+        if cal.isDateInToday(date) {
+            f.dateFormat = "h:mma"
+        } else {
+            f.dateFormat = "MMM d, h:mma"
+        }
+        return "Resets " + f.string(from: date).lowercased()
+    }
+
+    private func planRow(_ limit: PlanLimit) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(limit.label)
+                    .font(.caption).foregroundStyle(.secondary)
+                if !resetText(limit.resetsAt).isEmpty {
+                    Text("· " + resetText(limit.resetsAt))
+                        .font(.caption2).foregroundStyle(.tertiary)
+                        .lineLimit(1).layoutPriority(-1)
+                }
+                Spacer(minLength: 8)
+                Text("\(Int(limit.percent.rounded()))%")
+                    .font(.caption.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(limit.color)
+            }
+            ProgressView(value: min(max(limit.percent, 0), 100), total: 100)
+                .progressViewStyle(.linear)
+                .tint(limit.color)
+        }
+    }
+
+    private var planCard: some View {
+        Card(title: "Plan Usage", icon: "gauge.with.dots.needle.50percent") {
+            if let plan = store.planUsage, !plan.limits.isEmpty {
+                VStack(alignment: .leading, spacing: 7) {
+                    ForEach(plan.limits) { planRow($0) }
+                }
+            } else {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text("Loading plan limits…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
     private var usageCard: some View {
         Card(title: "Usage Today", icon: "chart.bar.fill") {
             if let u = store.usage {
-                InfoRow(icon: "sum", label: "Token usage", value: formatTokens(u.billable),
-                        valueColor: .blue,
-                        help: "Billable = input + output + cache create (\(u.billable) tokens)")
-                InfoRow(icon: "dollarsign.circle", label: "Est. cost", value: formatUSD(u.costUSD),
-                        valueColor: .green,
-                        help: "Estimated API cost for today's tokens, priced per model (Opus/Sonnet/Haiku). Approximate.")
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: "sum")
+                        .font(.system(size: 11)).foregroundStyle(.secondary).frame(width: 16)
+                    Text("Today").font(.callout).foregroundStyle(.secondary)
+                    Spacer(minLength: 12)
+                    Text(formatTokens(u.billable))
+                        .font(.callout.weight(.semibold)).foregroundStyle(.blue)
+                    Text("·").font(.caption).foregroundStyle(.tertiary)
+                    Text(formatUSD(u.costUSD))
+                        .font(.callout.weight(.semibold).monospacedDigit()).foregroundStyle(.green)
+                }
+                .help("Billable \(u.billable) tokens · est. cost priced per model (Opus/Sonnet/Haiku), approximate")
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 6) {
                     usageCell("Input", u.input, icon: "arrow.down", color: .teal)
                     usageCell("Output", u.output, icon: "arrow.up", color: .blue)
@@ -1422,6 +1833,9 @@ struct ContentView: View {
                 }
                 if store.usageHistory.contains(where: { $0.costUSD > 0 }) {
                     sevenDayChart
+                }
+                if let t = store.usageTotals {
+                    periodTotals(t)
                 }
             } else {
                 HStack(spacing: 6) {
@@ -1447,6 +1861,30 @@ struct ContentView: View {
                     .foregroundStyle(.green)
             }
             UsageBars(data: week, tint: .green)
+        }
+        .padding(.top, 2)
+    }
+
+    private func periodTotalRow(_ label: String, billable: Int, cost: Double) -> some View {
+        HStack(spacing: 6) {
+            Text(label)
+                .font(.caption2).foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            Text(formatTokens(billable))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.primary)
+            Text(formatUSD(cost))
+                .font(.caption.weight(.semibold).monospacedDigit())
+                .foregroundStyle(.green)
+                .frame(minWidth: 52, alignment: .trailing)
+        }
+    }
+
+    private func periodTotals(_ t: PeriodTotals) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Divider().padding(.vertical, 1)
+            periodTotalRow("This month", billable: t.monthBillable, cost: t.monthCost)
+            periodTotalRow("All-time", billable: t.allBillable, cost: t.allCost)
         }
         .padding(.top, 2)
     }
@@ -1742,6 +2180,7 @@ struct TabSwitcher: View {
 
     private let tabs: [(tab: ContentView.Tab, icon: String, label: String)] = [
         (.status, "key.fill", "Status"),
+        (.system, "server.rack", "System"),
         (.settings, "slider.horizontal.3", "Settings"),
     ]
 
@@ -1834,6 +2273,156 @@ struct SettingToggle: View {
     }
 }
 
+/// "About the author" card with an animated Like button (heart pop + floating
+/// hearts + a thanks message). The liked state persists across launches.
+struct AboutSection: View {
+    @ObservedObject var store: StatusStore
+    @State private var liked = UserDefaults.standard.bool(forKey: "authorLiked")
+    @State private var showThanks = UserDefaults.standard.bool(forKey: "authorLiked")
+    @State private var pop = false
+    @State private var hearts: [FloatingHeart] = []
+
+    private let profile = URL(string: "https://github.com/haonguyenstech")!
+    private let repo = URL(string: "https://github.com/haonguyenstech/autoagent-status")!
+
+    private func metaRow(_ icon: String, _ label: String, _ value: String, mono: Bool = true) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon).font(.system(size: 10)).foregroundStyle(.secondary).frame(width: 14)
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            Text(value)
+                .font(mono ? .caption.weight(.medium).monospacedDigit() : .caption.weight(.medium))
+                .lineLimit(1).truncationMode(.middle)
+        }
+    }
+
+    struct FloatingHeart: Identifiable {
+        let id = UUID()
+        let x: CGFloat
+        let size: CGFloat
+        var up = false
+    }
+
+    var body: some View {
+        VStack(spacing: 12) {
+            HStack(spacing: 11) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(LinearGradient(colors: [.green, .teal],
+                                             startPoint: .topLeading, endPoint: .bottomTrailing))
+                    Text("HN").font(.system(size: 15, weight: .bold)).foregroundStyle(.white)
+                }
+                .frame(width: 40, height: 40)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Hao Nguyen").font(.callout.weight(.semibold))
+                    Text("Creator of AutoAgent Status").font(.caption2).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+                Button { NSWorkspace.shared.open(profile) } label: {
+                    Image(systemName: "person.crop.circle")
+                        .font(.system(size: 16)).foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain).help("Open GitHub profile")
+                Button { NSWorkspace.shared.open(repo) } label: {
+                    Image(systemName: "chevron.left.forwardslash.chevron.right")
+                        .font(.system(size: 13)).foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain).help("View source on GitHub")
+            }
+
+            VStack(spacing: 6) {
+                Divider().opacity(0.4)
+                metaRow("terminal.fill", "Built on",
+                        "auto-agent-ai " + (store.installedVersion.map { "v\($0)" } ?? "—"))
+                metaRow("macwindow", "This app", "AutoAgent Status v\(appVersion)")
+                if let role = store.status.role {
+                    metaRow("person.fill", "Signed in as",
+                            role.capitalized + (store.status.username.map { " · \($0)" } ?? ""), mono: false)
+                }
+                HStack(spacing: 5) {
+                    Image(systemName: "sparkles").font(.system(size: 10)).foregroundStyle(.yellow)
+                    Text("“Bringing AI to your life”")
+                        .font(.caption2).italic().foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                }
+                .padding(.top, 1)
+            }
+
+            Button { like() } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: liked ? "heart.fill" : "heart")
+                        .foregroundStyle(liked ? .pink : .secondary)
+                        .scaleEffect(pop ? 1.4 : 1)
+                    Text(liked ? "You liked this" : "Like")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(liked ? .pink : .primary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(liked ? AnyShapeStyle(Color.pink.opacity(0.14))
+                                    : AnyShapeStyle(.quaternary.opacity(0.6)))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(liked ? Color.pink.opacity(0.45) : .clear, lineWidth: 1)
+                )
+                .overlay(alignment: .top) {
+                    ZStack {
+                        ForEach(hearts) { h in
+                            Image(systemName: "heart.fill")
+                                .font(.system(size: h.size))
+                                .foregroundStyle(.pink)
+                                .offset(x: h.x, y: h.up ? -52 : 6)
+                                .opacity(h.up ? 0 : 1)
+                        }
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if showThanks {
+                Text("Thanks for the love! ❤️")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.pink)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .padding(12)
+        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func like() {
+        liked = true
+        UserDefaults.standard.set(true, forKey: "authorLiked")
+
+        // Heart pop
+        withAnimation(.spring(response: 0.22, dampingFraction: 0.42)) { pop = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            withAnimation(.easeOut(duration: 0.25)) { pop = false }
+        }
+        withAnimation(.easeOut(duration: 0.25)) { showThanks = true }
+
+        // Floating-hearts burst
+        let xs: [CGFloat] = [-40, -24, -10, 8, 22, 38]
+        let sizes: [CGFloat] = [9, 12, 8, 13, 10, 11]
+        let batch = (0..<6).map { FloatingHeart(x: xs[$0], size: sizes[$0]) }
+        hearts.append(contentsOf: batch)
+        let ids = batch.map(\.id)
+        withAnimation(.easeOut(duration: 0.9)) {
+            for id in ids {
+                if let idx = hearts.firstIndex(where: { $0.id == id }) { hearts[idx].up = true }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            let set = Set(ids)
+            hearts.removeAll { set.contains($0.id) }
+        }
+    }
+}
+
 // MARK: - App delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -1860,6 +2449,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
 
         store.$status.combineLatest(store.$busy, store.$keepAwake, store.$autoAwakeWithWatcher)
+            .combineLatest(store.$planUsage)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.updateIcon() }
             .store(in: &bag)
@@ -1877,28 +2467,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let desc = store.busy ?? store.status.headline
         button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: desc)
 
-        // Token countdown next to the icon, e.g. "2h 15m"
-        var title = ""
+        // Compact status beside the icon: token countdown · session usage % · ☕
+        var parts: [String] = []
         if store.busy == nil, let exp = store.status.expiresAt {
             let secs = exp.timeIntervalSinceNow
             if secs <= 0 {
                 // While the watcher is renewing, the warning icon alone is enough
-                title = store.status.watcherRunning ? "" : " expired"
+                if !store.status.watcherRunning { parts.append("expired") }
             } else {
                 let h = Int(secs) / 3600
                 let m = (Int(secs) % 3600) / 60
-                title = h > 0 ? " \(h)h \(m)m" : " \(m)m"
+                parts.append(h > 0 ? "\(h)h \(m)m" : "\(m)m")
             }
         }
+        if store.busy == nil,
+           let session = store.planUsage?.limits.first(where: { $0.label == "Session" }) {
+            parts.append("\(Int(session.percent.rounded()))%")
+        }
+        var title = parts.joined(separator: " · ")
         // Coffee marker while the Mac is held awake (manual or auto-with-watcher).
-        if store.busy == nil && store.isStayingAwake { title += " ☕" }
+        if store.busy == nil && store.isStayingAwake {
+            title += title.isEmpty ? "☕" : " ☕"
+        }
+        if !title.isEmpty { title = " " + title } // pad off the icon
         button.attributedTitle = NSAttributedString(
             string: title,
             attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .medium)])
         button.imagePosition = title.isEmpty ? .imageOnly : .imageLeft
         if button.image == nil { button.title = "AA" }
         let awakeNote = store.isStayingAwake ? " · keeping Mac awake" : ""
-        button.toolTip = "AutoAgent — \(desc)\(awakeNote)"
+        var usageNote = ""
+        if let p = store.planUsage, !p.limits.isEmpty {
+            usageNote = " · " + p.limits
+                .map { "\($0.label) \(Int($0.percent.rounded()))%" }
+                .joined(separator: ", ")
+        }
+        button.toolTip = "AutoAgent — \(desc)\(usageNote)\(awakeNote)"
     }
 
     @objc private func togglePopover() {
