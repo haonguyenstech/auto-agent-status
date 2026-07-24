@@ -41,6 +41,7 @@ struct CommandResult {
 /// (used to bail out of an interactive sign-in we can't complete unattended).
 @discardableResult
 func runCommand(_ path: String, _ args: [String], timeout: TimeInterval = 30,
+                extraPATH: [String] = [],
                 onOutput: ((String) -> Bool)? = nil) -> CommandResult {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: path)
@@ -53,6 +54,9 @@ func runCommand(_ path: String, _ args: [String], timeout: TimeInterval = 30,
     if let cli = cachedCLIPath {
         extraPaths.insert((cli as NSString).deletingLastPathComponent, at: 0)
     }
+    // Highest-priority PATH entries (e.g. the no-op `open` shim used to stop the
+    // login flow from auto-launching the sign-in browser).
+    extraPaths.insert(contentsOf: extraPATH, at: 0)
     env["PATH"] = extraPaths.joined(separator: ":") + ":" + (env["PATH"] ?? "/usr/bin:/bin")
     proc.environment = env
     let pipe = Pipe()
@@ -103,6 +107,26 @@ func runCommand(_ path: String, _ args: [String], timeout: TimeInterval = 30,
 
 func stripANSI(_ s: String) -> String {
     s.replacingOccurrences(of: "\u{1B}\\[[0-9;]*[A-Za-z]", with: "", options: .regularExpression)
+}
+
+/// A directory whose `open` is a no-op script. Prepending it to a child's PATH
+/// stops the CLI from auto-launching the Microsoft sign-in browser — which pops
+/// a loading icon in the Dock on every login. The URL is still printed (and the
+/// app shows an in-app "Open sign-in page" button), so sign-in still works; the
+/// browser only appears when the user deliberately taps that button.
+func noOpenShimDir() -> String? {
+    let fm = FileManager.default
+    guard let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
+    let dir = base.appendingPathComponent("AutoAgent Status/shim", isDirectory: true)
+    let openPath = dir.appendingPathComponent("open")
+    do {
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        if !fm.isExecutableFile(atPath: openPath.path) {
+            try "#!/bin/sh\nexit 0\n".write(to: openPath, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: openPath.path)
+        }
+        return dir.path
+    } catch { return nil }
 }
 
 /// The CLI hard-blocks with an "Update required" box when the installed
@@ -856,6 +880,149 @@ final class SleepGuard {
     }
 }
 
+// MARK: - Clamshell (lid-closed) keep-awake — runs `pmset disablesleep`
+
+/// Keeps the Mac running with the lid CLOSED and no external display attached.
+///
+/// `caffeinate`/IOKit assertions can't do this — closing the lid triggers a
+/// firmware-level "clamshell sleep" that ignores every power assertion. The one
+/// software lever Apple still exposes (even on Apple Silicon) is the pmset
+/// `disablesleep` flag, exactly what Amphetamine's Closed-Display Mode flips:
+///   `pmset -a disablesleep 1`  → lid-close never sleeps
+///   `pmset -a disablesleep 0`  → back to normal
+///
+/// `disablesleep` needs root. To avoid a password prompt on every toggle (and,
+/// crucially, on the silent revert we run when the app quits), we install a
+/// tightly-scoped passwordless sudoers rule on first use — one admin prompt
+/// ever, allowing ONLY `pmset -a disablesleep 0|1` for this user. After that
+/// every flip is silent.
+///
+/// SAFETY: `disablesleep` is a persistent system setting, not tied to our PID —
+/// if we leave it on and the app dies, the Mac never sleeps with no UI to undo
+/// it. So we revert on quit, and clear an "armed" flag on clean exit; a stale
+/// flag on next launch means we crashed mid-session and we silently revert.
+final class ClamshellGuard {
+    private(set) var active = false
+    private let sudoersPath = "/etc/sudoers.d/autoagent-clamshell"
+    private let armedKey = "clamshellArmed"
+
+    var sudoersInstalled: Bool { FileManager.default.fileExists(atPath: sudoersPath) }
+
+    /// Actual kernel state, read from `pmset -g` (`SleepDisabled 1`).
+    var systemDisabled: Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+        p.arguments = ["-g"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return false }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard let out = String(data: data, encoding: .utf8) else { return false }
+        return out.range(of: #"SleepDisabled\s+1"#, options: .regularExpression) != nil
+    }
+
+    /// Flip `disablesleep` silently via the NOPASSWD sudoers rule. Returns true
+    /// on success; false if the rule isn't installed or sudo declined.
+    @discardableResult
+    private func silentSet(_ on: Bool) -> Bool {
+        guard sudoersInstalled else { return false }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+        p.arguments = ["-n", "/usr/bin/pmset", "-a", "disablesleep", on ? "1" : "0"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run(); p.waitUntilExit() } catch { return false }
+        return p.terminationStatus == 0
+    }
+
+    /// Enable lid-closed mode. Installs the sudoers rule on first use (one admin
+    /// prompt), then flips the flag. Returns nil on success or an error message
+    /// ("cancelled" if the user dismissed the password prompt).
+    func enable() -> String? {
+        if silentSet(true) {
+            active = true
+            UserDefaults.standard.set(true, forKey: armedKey)
+            return nil
+        }
+        if let err = privileged(installAndSetScript(on: true)) { return err }
+        active = true
+        UserDefaults.standard.set(true, forKey: armedKey)
+        return nil
+    }
+
+    /// Turn lid-closed mode off. Silent when the sudoers rule exists; otherwise
+    /// falls back to a one-off admin prompt.
+    func disable() -> String? {
+        defer { UserDefaults.standard.set(false, forKey: armedKey) }
+        if silentSet(false) { active = false; return nil }
+        if let err = privileged(setScript(on: false)) { return err }
+        active = false
+        return nil
+    }
+
+    /// Best-effort silent revert for app-quit / crash-recovery. Never prompts.
+    func revertQuietly() {
+        silentSet(false)
+        active = false
+        UserDefaults.standard.set(false, forKey: armedKey)
+    }
+
+    /// True if a previous run left the flag armed without a clean revert
+    /// (crash / force-quit) — the caller should revert on launch.
+    var leftOrphaned: Bool {
+        UserDefaults.standard.bool(forKey: armedKey) && systemDisabled
+    }
+
+    // MARK: Privileged helpers
+
+    /// Shell run as root via a single `with administrator privileges` prompt.
+    /// Body is staged to a temp file so we don't have to escape it into AppleScript.
+    private func privileged(_ body: String) -> String? {
+        let path = (NSTemporaryDirectory() as NSString).appendingPathComponent("autoagent-clamshell.sh")
+        do { try body.write(toFile: path, atomically: true, encoding: .utf8) }
+        catch { return "could not stage helper script" }
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let source = "do shell script \"/bin/sh \(path)\" with administrator privileges"
+        var errorDict: NSDictionary?
+        guard let apple = NSAppleScript(source: source) else { return "could not build helper" }
+        apple.executeAndReturnError(&errorDict)
+        if let e = errorDict {
+            let code = (e["NSAppleScriptErrorNumber"] as? Int) ?? 0
+            if code == -128 { return "cancelled" } // user dismissed the prompt
+            return (e["NSAppleScriptErrorMessage"] as? String) ?? "admin command failed (\(code))"
+        }
+        return nil
+    }
+
+    private func setScript(on: Bool) -> String {
+        "/usr/bin/pmset -a disablesleep \(on ? "1" : "0")\n"
+    }
+
+    /// Validate + install the NOPASSWD sudoers rule, then set the flag — all in
+    /// the one root shell so it costs a single password prompt.
+    private func installAndSetScript(on: Bool) -> String {
+        let user = NSUserName()
+        return """
+        #!/bin/sh
+        set -e
+        CONTENT='\(user) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1'
+        TMP=$(mktemp)
+        printf '%s\\n' "$CONTENT" > "$TMP"
+        if /usr/sbin/visudo -cf "$TMP" >/dev/null 2>&1; then
+          /usr/bin/install -m 0440 -o root -g wheel "$TMP" \(sudoersPath)
+          rm -f "$TMP"
+        else
+          rm -f "$TMP"
+          exit 3
+        fi
+        /usr/bin/pmset -a disablesleep \(on ? "1" : "0")
+        """
+    }
+}
+
 // MARK: - Store
 
 final class StatusStore: ObservableObject {
@@ -898,6 +1065,12 @@ final class StatusStore: ObservableObject {
     /// The Mac is being held awake — manually, or automatically while the watcher runs.
     var isStayingAwake: Bool { keepAwake || (autoAwakeWithWatcher && status.watcherRunning) }
 
+    /// Lid-closed (clamshell) keep-awake: run with the lid shut, no external
+    /// display needed. Session-scoped — reverted on quit for safety.
+    @Published var lidClosedAwake = false
+    @Published var lidClosedBusy = false
+    private let clamshellGuard = ClamshellGuard()
+
     private let workQueue = DispatchQueue(label: "auto-agent-status.work")
     private let usageQueue = DispatchQueue(label: "auto-agent-status.usage", qos: .utility)
     private var lastVersionCheck = Date.distantPast
@@ -925,6 +1098,11 @@ final class StatusStore: ObservableObject {
     @Published var cliPath: String?
 
     init() {
+        // Recover from an unclean previous exit: if lid-closed mode was armed but
+        // never reverted (crash / force-quit), the Mac is stuck never-sleeping —
+        // silently clear it now.
+        if clamshellGuard.leftOrphaned { clamshellGuard.revertQuietly() }
+
         // Restore keep-awake across relaunches (notably the app's own self-update).
         defer { syncSleepGuard() }
         guard UserDefaults.standard.bool(forKey: "keepAwake") else { return }
@@ -953,6 +1131,42 @@ final class StatusStore: ObservableObject {
         autoAwakeWithWatcher = on
         UserDefaults.standard.set(on, forKey: "autoAwakeWithWatcher")
         syncSleepGuard()
+    }
+
+    /// Toggle lid-closed (clamshell) keep-awake. The privileged flip runs off the
+    /// main thread so the SwiftUI switch stays responsive during the (first-time)
+    /// password prompt; on failure we roll the toggle back and surface the error.
+    func setLidClosedAwake(_ on: Bool) {
+        guard !lidClosedBusy else { return }
+        lidClosedBusy = true
+        // Also hold a normal caffeinate guard so display/idle sleep is covered too.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let err = on ? self.clamshellGuard.enable() : self.clamshellGuard.disable()
+            DispatchQueue.main.async {
+                self.lidClosedBusy = false
+                if let err {
+                    if err != "cancelled" {
+                        self.lastError = "Lid-closed mode: \(err)"
+                        notify("Lid-closed mode failed", err, kind: .keepAwake)
+                    }
+                    self.lidClosedAwake = self.clamshellGuard.active // reflect reality
+                    return
+                }
+                self.lidClosedAwake = on
+                if on {
+                    notify("Lid-closed mode on",
+                           "Your Mac stays running with the lid shut — no external display needed.",
+                           kind: .keepAwake)
+                }
+            }
+        }
+    }
+
+    /// Called on app quit — always undo the persistent `disablesleep` flag so we
+    /// never orphan a never-sleeping Mac.
+    func tearDownClamshell() {
+        clamshellGuard.revertQuietly()
     }
 
     func isNotifyOn(_ kind: NotifKind) -> Bool {
@@ -1240,10 +1454,14 @@ final class StatusStore: ObservableObject {
         lastUserAction = Date()
         // Interactive sign-in waits on the browser callback, so give it room.
         let timeout: TimeInterval = interactive ? 180 : 90
+        // For interactive logins, block the CLI's automatic browser launch (it
+        // pops a loading icon in the Dock); the user opens the sign-in page from
+        // the in-app banner instead.
+        let extraPATH = interactive ? [noOpenShimDir()].compactMap { $0 } : []
         workQueue.async {
             var sawURL = false
             var abortedForAuth = false
-            let result = runCommand(cli, args, timeout: timeout) { text in
+            let result = runCommand(cli, args, timeout: timeout, extraPATH: extraPATH) { text in
                 // Only logins surface a sign-in URL; ignore everything else.
                 guard interactive || isAutoRestart, !sawURL, let url = extractLoginURL(text) else { return false }
                 sawURL = true
@@ -1539,6 +1757,7 @@ struct ContentView: View {
     private var settingsTab: some View {
         VStack(spacing: 4) {
             KeepAwakeRow(store: store)
+            LidClosedRow(store: store)
             SettingToggle(
                 icon: "eye.fill", tint: .indigo,
                 title: "Auto-awake with watcher",
@@ -1965,7 +2184,7 @@ struct ContentView: View {
                 .padding(.vertical, 14)
             } else {
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
-                    ActionButton(title: "Client Login", icon: "person.fill", color: .teal,
+                    ActionButton(title: "Login", icon: "person.fill", color: .teal,
                                  disabled: store.cliPath == nil) { store.login(role: "client") }
                     ActionButton(title: "Logout", icon: "rectangle.portrait.and.arrow.right", color: .red,
                                  disabled: store.cliPath == nil) { confirmLogout = true }
@@ -2011,7 +2230,7 @@ struct ContentView: View {
                 Text("Finish signing in")
                     .font(.callout.weight(.semibold))
             }
-            Text("Complete the Microsoft sign-in in your browser. If it didn't open, use the button below.")
+            Text("Tap “Open sign-in page” to finish the Microsoft sign-in in your browser.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -2143,6 +2362,63 @@ struct KeepAwakeRow: View {
         }
         .buttonStyle(.plain)
         .help(label == "∞" ? "Stay awake until turned off" : "Stay awake for \(label)")
+    }
+}
+
+/// Lid-closed (clamshell) keep-awake toggle. Flips pmset `disablesleep` so the
+/// Mac keeps running with the lid shut — no external display required. Shows a
+/// spinner while the (first-time) admin prompt is up.
+struct LidClosedRow: View {
+    @ObservedObject var store: StatusStore
+    private let tint = Color.teal
+    @State private var hovering = false
+
+    private var subtitle: String {
+        if store.lidClosedBusy { return "Authorizing…" }
+        if store.lidClosedAwake { return "Lid can be closed — no monitor needed" }
+        return "Run with the lid shut (asks for password once)"
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: store.lidClosedAwake ? "laptopcomputer.slash" : "laptopcomputer")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(store.lidClosedAwake ? Color.white : tint)
+                .frame(width: 26, height: 26)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(tint.opacity(store.lidClosedAwake ? 0.95 : 0.16))
+                )
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Keep awake with lid closed")
+                    .font(.callout.weight(.medium))
+                Text(subtitle)
+                    .font(.caption2)
+                    .foregroundStyle(store.lidClosedAwake ? tint : .secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            if store.lidClosedBusy {
+                ProgressView().controlSize(.small)
+            } else {
+                Toggle("", isOn: Binding(get: { store.lidClosedAwake },
+                                         set: { store.setLidClosedAwake($0) }))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .tint(tint)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(store.lidClosedAwake ? AnyShapeStyle(tint.opacity(0.06)) : AnyShapeStyle(.quaternary.opacity(hovering ? 0.45 : 0)))
+        )
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.12), value: hovering)
+        .help("Uses pmset disablesleep (like Amphetamine). Reverted automatically when you quit.")
     }
 }
 
@@ -2459,6 +2735,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.store.refresh()
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        // Undo the persistent lid-closed `disablesleep` flag so quitting never
+        // leaves the Mac stuck never-sleeping.
+        store.tearDownClamshell()
     }
 
     private func updateIcon() {
