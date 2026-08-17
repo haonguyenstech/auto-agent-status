@@ -9,16 +9,27 @@ credential status at a glance, without ever opening a terminal.
   warning when something is wrong
 - 📋 **Status panel** — credential (role, token expiry), today's Claude Code
   token usage (same numbers as the CLI), watcher state, server health
-- 🖱 **One-click actions** — Client Login / Logout
+- 🖱 **One-click actions** — Login / Logout, plus **Push credential** for the
+  primary user (owner), mirroring the CLI menu
+- 👥 **Session info** — which AI session this Mac pulls from and who else is on
+  it, straight from `/ai-sessions/me`
+- 🎨 **Figma tab** — mirrors `auto-agent-ai figma`: the shared session you're
+  assigned to (name, which account it signs you in as, when it was captured),
+  the Figma accounts signed in on this Mac, and a one-tap import — Figma
+  Desktop is quit and reopened for you, since the CLI can't write cookies while
+  it's running. Import is offered only when a login has actually been uploaded,
+  exactly like the CLI. Owners also get Share / Revoke / Switch token
 - 🔐 **Microsoft sign-in** — opens your browser for OAuth and shows the sign-in
   link (with Open / Copy) as a fallback if the browser doesn't pop up
 - 🔔 **Notifications** — watcher stopped, credential wiped, token expired,
-  sign-in required, back to normal
+  sign-in required, Figma session imported, back to normal
 - 🔄 **Self-healing** — if the watcher dies, the app logs in again
   automatically with your last role (toggleable)
 - ⬆️ **Auto-updates** — the app updates itself from this repo's Releases
-  ("Update App" button), and offers to update the CLI when a new npm version
-  ships (including the CLI's "update required" hard-block)
+  ("Update App" button), and offers to update the CLI when a new version ships.
+  The CLI check uses the server's own version gate (`/app-versions/check`), so
+  you see the release notes and get warned about a mandatory update *before* a
+  command hits the "update required" hard-block
 
 ## Install
 
@@ -46,7 +57,9 @@ bash Install.command
 ### Requirements
 
 - macOS 13+ (Apple Silicon or Intel — the binary is universal)
-- [Node.js](https://nodejs.org) ≥ 18 (for the CLI)
+- [Node.js](https://nodejs.org) ≥ 18 (for the CLI) — the **Figma tab** needs
+  Node ≥ 22.5, which the CLI uses for its built-in SQLite cookie access
+- Figma Desktop in `/Applications` (only for the Figma tab)
 - The `auto-agent-ai` CLI:
   ```bash
   npm install -g @saigontechnology/auto-agent

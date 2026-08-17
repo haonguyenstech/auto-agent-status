@@ -611,6 +611,130 @@ func pushUsageReport(server: String, role: String?, today: TokenUsage,
     _ = sem.wait(timeout: .now() + 14)
 }
 
+// MARK: - auto-agent server API (same base + auth the CLI uses)
+
+/// GET `{server}/api/v1/<path>` with the CLI's stored session token and its
+/// `X-Client-Version` header. Returns the unwrapped `data` field, or nil.
+func agentAPIGet(_ path: String, server: String) -> Any? {
+    guard let token = readAgentAuthToken() else { return nil }
+    let base = server.hasSuffix("/") ? String(server.dropLast()) : server
+    guard let url = URL(string: "\(base)/api/v1/\(path)") else { return nil }
+    var req = URLRequest(url: url)
+    req.timeoutInterval = 12
+    req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    req.setValue(installedCLIVersion() ?? appVersion, forHTTPHeaderField: "X-Client-Version")
+
+    var result: Any?
+    let sem = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: req) { data, resp, _ in
+        defer { sem.signal() }
+        guard let data, let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+        result = obj["data"]
+    }.resume()
+    _ = sem.wait(timeout: .now() + 14)
+    return result
+}
+
+/// The server's own CLI version gate (`GET /app-versions/check?version=…`) —
+/// the same call the CLI makes before every command. It is the authority on
+/// what's current: it knows the minimum version (`forceUpdate`, the hard block
+/// that makes the CLI refuse to run) and ships release notes, neither of which
+/// the npm registry can tell us.
+struct CLIVersionCheck: Equatable {
+    var latest: String
+    var updateAvailable: Bool
+    var forceUpdate: Bool
+    var notes: String?
+}
+
+func fetchCLIVersionCheck(server: String, installed: String?) -> CLIVersionCheck? {
+    guard let version = installed ?? installedCLIVersion() else { return nil }
+    guard let obj = agentAPIGet("app-versions/check?version=\(version)", server: server) as? [String: Any],
+          let latest = obj["latestVersion"] as? String else { return nil }
+    let notes = (obj["description"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    return CLIVersionCheck(latest: latest,
+                           updateAvailable: obj["updateAvailable"] as? Bool ?? false,
+                           forceUpdate: obj["forceUpdate"] as? Bool ?? false,
+                           notes: (notes?.isEmpty ?? true) ? nil : notes)
+}
+
+private let isoParser: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return f
+}()
+
+func parseISODate(_ s: String?) -> Date? {
+    guard let s else { return nil }
+    return isoParser.date(from: s) ?? ISO8601DateFormatter().date(from: s)
+}
+
+/// The Claude Code session this machine is assigned to (`GET /ai-sessions/me`) —
+/// the CLI shows its name in the menu header; the app shows it in Credential.
+struct AISessionInfo: Equatable {
+    var id: String
+    var name: String
+    var isActive: Bool
+    var updatedAt: Date?
+    var members: [String]
+    var createdBy: String?
+}
+
+func fetchAISession(server: String, sessionId: String?) -> AISessionInfo? {
+    guard let arr = agentAPIGet("ai-sessions/me", server: server) as? [[String: Any]],
+          !arr.isEmpty else { return nil }
+    let obj = arr.first { ($0["id"] as? String) == sessionId } ?? arr[0]
+    guard let id = obj["id"] as? String else { return nil }
+    let members = (obj["assignedUsers"] as? [[String: Any]])?
+        .compactMap { $0["username"] as? String } ?? []
+    let creator = (obj["createdBy"] as? [String: Any])?["displayName"] as? String
+    return AISessionInfo(id: id,
+                         name: obj["name"] as? String ?? "session",
+                         isActive: obj["isActive"] as? Bool ?? true,
+                         updatedAt: parseISODate(obj["updatedAt"] as? String),
+                         members: members,
+                         createdBy: creator)
+}
+
+/// The shared Figma session assigned to this user (`GET /figma-sessions/me`).
+/// The CLI only offers its Figma menu when this exists, and only offers
+/// "Login to Figma" when `hasSession` is true — the app mirrors both rules.
+struct FigmaSessionInfo: Equatable {
+    var sessionId: String
+    var name: String
+    var isActive: Bool
+    var hasSession: Bool
+    var cookieCount: Int
+    var accounts: [FigmaAccount]
+    var capturedAt: Date?
+    var memberCount: Int
+
+    /// "figma3@company.com" — what the shared login actually signs you in as.
+    var sharedLabel: String? {
+        accounts.first?.email ?? (cookieCount > 0 ? "\(cookieCount) cookies" : nil)
+    }
+}
+
+func fetchFigmaSession(server: String) -> FigmaSessionInfo? {
+    guard let arr = agentAPIGet("figma-sessions/me", server: server) as? [[String: Any]],
+          let obj = arr.first else { return nil }
+    let accounts = (obj["accounts"] as? [[String: Any]])?.compactMap { a -> FigmaAccount? in
+        guard let id = a["id"] as? String, let label = a["label"] as? String else { return nil }
+        return FigmaAccount(id: id, email: label, active: a["active"] as? Bool ?? false,
+                            plan: a["plan"] as? String)
+    } ?? []
+    return FigmaSessionInfo(
+        sessionId: obj["sessionId"] as? String ?? "",
+        name: obj["name"] as? String ?? "Figma session",
+        isActive: obj["isActive"] as? Bool ?? true,
+        hasSession: obj["hasSession"] as? Bool ?? false,
+        cookieCount: obj["cookieCount"] as? Int ?? 0,
+        accounts: accounts,
+        capturedAt: parseISODate(obj["capturedAt"] as? String),
+        memberCount: (obj["assignedUsernames"] as? [String])?.count ?? 0)
+}
+
 // MARK: - Plan usage (subscription rate limits — the same session/weekly
 // percentages Claude Code's /usage screen shows, from the OAuth usage endpoint)
 
@@ -687,7 +811,7 @@ func fetchPlanUsage() -> PlanUsage? {
 
 /// Notification categories the user can mute individually (default: on).
 enum NotifKind: String, CaseIterable {
-    case watcher, credential, updates, signIn, keepAwake
+    case watcher, credential, updates, signIn, keepAwake, figma
 
     var key: String { "notify_\(rawValue)" }
     var enabled: Bool { UserDefaults.standard.object(forKey: key) as? Bool ?? true }
@@ -699,6 +823,7 @@ enum NotifKind: String, CaseIterable {
         case .updates: return "Updates"
         case .signIn: return "Sign-in prompts"
         case .keepAwake: return "Keep-awake"
+        case .figma: return "Figma session"
         }
     }
     var icon: String {
@@ -708,6 +833,7 @@ enum NotifKind: String, CaseIterable {
         case .updates: return "arrow.down.circle"
         case .signIn: return "person.badge.shield.checkmark"
         case .keepAwake: return "cup.and.saucer"
+        case .figma: return "paintpalette"
         }
     }
 }
@@ -735,6 +861,12 @@ struct AgentStatus {
     var lastLogLine: String?
     var serverOK: Bool?
     var serverLatencyMs: Int?
+    /// Written by the CLI for the primary user (owner): the per-session
+    /// handshake token `push` / `figma upload|revoke` need, and its session id.
+    var handshakeToken: String?
+    var sessionId: String?
+
+    var isOwner: Bool { role == "owner" }
 
     var credentialValid: Bool {
         guard let e = expiresAt else { return false }
@@ -800,6 +932,8 @@ func readStatus() -> AgentStatus {
         s.role = obj["role"] as? String
         s.username = obj["username"] as? String
         s.serverUrl = obj["serverUrl"] as? String
+        s.sessionId = obj["sessionId"] as? String
+        s.handshakeToken = (obj["handshakeToken"] as? String).flatMap { $0.isEmpty ? nil : $0 }
     }
 
     // 3. Server reachability
@@ -837,6 +971,117 @@ func readStatus() -> AgentStatus {
     }
 
     return s
+}
+
+// MARK: - Figma session sharing (`auto-agent-ai figma …`, CLI ≥ 1.1.16)
+
+/// One Figma account signed in on this Mac, as printed by `figma list`:
+///   `1) me@company.com (active)  id=15761…  plan=team:11803…`
+struct FigmaAccount: Identifiable, Equatable {
+    let id: String
+    let email: String
+    let active: Bool
+    let plan: String?
+
+    /// "team" / "pro" — the part before the plan's org id.
+    var planKind: String? {
+        guard let plan, !plan.isEmpty else { return nil }
+        return plan.split(separator: ":").first.map(String.init)
+    }
+}
+
+struct FigmaState: Equatable {
+    var accounts: [FigmaAccount] = []
+    /// Why we couldn't read the local Figma profile (Figma not installed, Node
+    /// too old, Keychain unreadable…). Shown instead of the account list.
+    var problem: String?
+    var desktopRunning = false
+    var checked = false
+
+    var activeAccount: FigmaAccount? { accounts.first { $0.active } ?? accounts.first }
+}
+
+/// Figma Desktop must be fully quit before cookies can be written/removed —
+/// the CLI refuses otherwise ("Figma Desktop is running. Quit it completely").
+func figmaDesktopApps() -> [NSRunningApplication] {
+    NSRunningApplication.runningApplications(withBundleIdentifier: "com.figma.Desktop")
+}
+
+func figmaDesktopRunning() -> Bool {
+    if !figmaDesktopApps().isEmpty { return true }
+    // Fall back to the same check the CLI does (covers a renamed bundle id).
+    return runCommand("/usr/bin/pgrep", ["-x", "Figma"], timeout: 5).code == 0
+}
+
+let figmaAppPath = "/Applications/Figma.app"
+
+/// Ask Figma Desktop to quit and wait (up to `timeout`) for it to actually go.
+@discardableResult
+func quitFigmaDesktop(timeout: TimeInterval = 12) -> Bool {
+    let apps = figmaDesktopApps()
+    apps.forEach { $0.terminate() }
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if !figmaDesktopRunning() { return true }
+        usleep(300_000)
+    }
+    // Last resort: force it, then give it a moment.
+    figmaDesktopApps().forEach { $0.forceTerminate() }
+    usleep(800_000)
+    return !figmaDesktopRunning()
+}
+
+private let figmaLineRegex = try? NSRegularExpression(
+    pattern: #"\d+\)\s+(\S+?)(\s+\(active\))?\s+id=([A-Za-z0-9_-]+)(?:\s+plan=(\S+))?\s*$"#)
+
+/// Parse `auto-agent-ai figma list`. Its lines carry a `HH:MM:SS` log prefix,
+/// so match on the trailing `N) email … id=… plan=…` shape only.
+func parseFigmaList(_ output: String) -> [FigmaAccount] {
+    guard let re = figmaLineRegex else { return [] }
+    var out: [FigmaAccount] = []
+    for raw in stripANSI(output).split(separator: "\n") {
+        let line = String(raw)
+        let ns = line as NSString
+        guard let m = re.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) else { continue }
+        func group(_ i: Int) -> String? {
+            let r = m.range(at: i)
+            return r.location == NSNotFound ? nil : ns.substring(with: r).trimmingCharacters(in: .whitespaces)
+        }
+        guard let email = group(1), let id = group(3) else { continue }
+        out.append(FigmaAccount(id: id, email: email, active: group(2) != nil, plan: group(4)))
+    }
+    return out
+}
+
+func readFigmaState() -> FigmaState {
+    var s = FigmaState()
+    s.desktopRunning = figmaDesktopRunning()
+    s.checked = true
+    guard let cli = findCLI() else {
+        s.problem = "auto-agent-ai CLI not found."
+        return s
+    }
+    let r = runCommand(cli, ["figma", "list"], timeout: 45)
+    let text = stripANSI(r.output)
+    s.accounts = parseFigmaList(text)
+    if s.accounts.isEmpty {
+        if text.lowercased().contains("no figma account is signed in") {
+            s.problem = nil // genuinely signed out — not an error
+        } else if r.code != 0 || text.isEmpty {
+            // Surface the CLI's own explanation (missing profile, old Node, …).
+            let line = text.split(separator: "\n").map(String.init)
+                .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
+            s.problem = line.map { stripLogTimestamp($0) } ?? "Couldn't read the Figma profile."
+        }
+    }
+    return s
+}
+
+/// Drop the CLI's `10:09:37  ` log prefix so messages read cleanly in the UI.
+func stripLogTimestamp(_ s: String) -> String {
+    s.replacingOccurrences(of: #"^\s*\d{2}:\d{2}:\d{2}\s*"#, with: "",
+                           options: .regularExpression)
+        .trimmingCharacters(in: .whitespaces)
 }
 
 // MARK: - Keep-awake (runs `caffeinate` — mirrors the proven `live` shell alias)
@@ -1045,13 +1290,43 @@ final class StatusStore: ObservableObject {
     @Published var notifyUpdates = NotifKind.updates.enabled
     @Published var notifySignIn = NotifKind.signIn.enabled
     @Published var notifyKeepAwake = NotifKind.keepAwake.enabled
+    @Published var notifyFigma = NotifKind.figma.enabled
     @Published var appLatestVersion: String?
     @Published var appDownloadURL: String?
     @Published var updatingApp = false
     /// CLI returned the "Update required" hard-block — it can't run until updated.
     @Published var cliUpdateRequired = false
+    /// What's in the newest CLI release, per the server's version check.
+    @Published var cliReleaseNotes: String?
     /// Microsoft sign-in URL while an interactive login is waiting on the browser.
     @Published var loginURL: String?
+
+    // Figma session sharing (`auto-agent-ai figma`).
+    @Published var figma = FigmaState()
+    /// Name of the running figma command ("import", "sign out", …), or nil.
+    @Published var figmaBusy: String?
+    @Published var figmaError: String?
+    /// Owner/primary-user handshake token used by `push` / `figma upload|revoke`.
+    /// The CLI stores its own copy in state.json once you log in as primary
+    /// user; this is the fallback when it hasn't (or for a different session).
+    @Published var figmaToken = UserDefaults.standard.string(forKey: "figmaToken") ?? ""
+    /// The shared Figma session assigned to this user, server-side.
+    @Published var figmaSession: FigmaSessionInfo?
+    /// The Claude Code session this machine pulls its credential from.
+    @Published var aiSession: AISessionInfo?
+
+    /// A token typed here wins (that's the user switching sessions on purpose);
+    /// otherwise use the one the CLI stored in state.json at login.
+    var handshakeToken: String? {
+        let typed = figmaToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !typed.isEmpty { return typed }
+        if let t = status.handshakeToken, !t.isEmpty { return t }
+        return nil
+    }
+
+    /// The CLI only offers "Login to Figma" when a login has been uploaded to
+    /// the assigned session — same gate here.
+    var canImportFigma: Bool { figmaSession?.hasSession == true }
 
     // Keep-awake: prevent the Mac from sleeping for a chosen duration.
     @Published var keepAwake = false
@@ -1073,6 +1348,9 @@ final class StatusStore: ObservableObject {
 
     private let workQueue = DispatchQueue(label: "auto-agent-status.work")
     private let usageQueue = DispatchQueue(label: "auto-agent-status.usage", qos: .utility)
+    private let figmaQueue = DispatchQueue(label: "auto-agent-status.figma")
+    private var lastFigmaScan = Date.distantPast
+    private var lastSessionFetch = Date.distantPast
     private var lastVersionCheck = Date.distantPast
     private var lastUsageScan = Date.distantPast
     private var lastPlanFetch = Date.distantPast
@@ -1176,6 +1454,7 @@ final class StatusStore: ObservableObject {
         case .updates: return notifyUpdates
         case .signIn: return notifySignIn
         case .keepAwake: return notifyKeepAwake
+        case .figma: return notifyFigma
         }
     }
 
@@ -1187,6 +1466,7 @@ final class StatusStore: ObservableObject {
         case .updates: notifyUpdates = on
         case .signIn: notifySignIn = on
         case .keepAwake: notifyKeepAwake = on
+        case .figma: notifyFigma = on
         }
     }
 
@@ -1264,6 +1544,25 @@ final class StatusStore: ObservableObject {
         checkVersions()
         refreshUsage()
         refreshPlanUsage()
+        refreshFigmaDesktopFlag()
+        refreshSessions()
+    }
+
+    /// Fetch the AI + Figma sessions this user is assigned to (network only —
+    /// no CLI call). Same 5-minute cadence as the other server reads.
+    func refreshSessions(force: Bool = false) {
+        guard force || Date().timeIntervalSince(lastSessionFetch) > 300 else { return }
+        lastSessionFetch = Date()
+        let server = status.serverUrl ?? defaultServer
+        let sessionId = status.sessionId
+        usageQueue.async {
+            let ai = fetchAISession(server: server, sessionId: sessionId)
+            let figma = fetchFigmaSession(server: server)
+            DispatchQueue.main.async {
+                if ai != nil || self.status.role != nil { self.aiSession = ai }
+                self.figmaSession = figma
+            }
+        }
     }
 
     /// Scan today's Claude transcripts (at most every 5 min — it reads files).
@@ -1310,10 +1609,14 @@ final class StatusStore: ObservableObject {
     func checkVersions(force: Bool = false) {
         guard force || Date().timeIntervalSince(lastVersionCheck) > 6 * 3600 else { return }
         lastVersionCheck = Date()
+        let server = status.serverUrl ?? defaultServer
         workQueue.async {
             let installed = installedCLIVersion()
-            var latest: String?
-            if let npm = npmPath {
+            // The server's gate is the authority (it knows the *minimum*
+            // version and the release notes); npm is the fallback.
+            let check = fetchCLIVersionCheck(server: server, installed: installed)
+            var latest: String? = check?.latest
+            if latest == nil, let npm = npmPath {
                 let r = runCommand(npm, ["view", cliPackage, "version"], timeout: 30)
                 if r.code == 0,
                    let line = r.output.split(separator: "\n").last?.trimmingCharacters(in: .whitespaces),
@@ -1325,6 +1628,18 @@ final class StatusStore: ObservableObject {
             DispatchQueue.main.async {
                 self.installedVersion = installed
                 self.latestVersion = latest
+                if let check {
+                    self.cliReleaseNotes = check.notes
+                    // Surface the hard block *before* a command fails on it.
+                    if check.forceUpdate, !self.cliUpdateRequired {
+                        self.cliUpdateRequired = true
+                        notify("CLI update required",
+                               "auto-agent-ai v\(check.latest) is mandatory — the CLI is blocked until you update.",
+                               kind: .updates)
+                    } else if !check.forceUpdate, !check.updateAvailable {
+                        self.cliUpdateRequired = false
+                    }
+                }
                 if let appRelease {
                     self.appLatestVersion = appRelease.version
                     self.appDownloadURL = appRelease.zipURL
@@ -1339,7 +1654,10 @@ final class StatusStore: ObservableObject {
                         notify("CLI update", "Auto-updating auto-agent-ai v\(installed) → v\(latest)…", kind: .updates)
                         self.updateCLI()
                     } else {
-                        notify("CLI update available", "auto-agent-ai v\(latest) is available (you have v\(installed)).", kind: .updates)
+                        let notes = self.cliReleaseNotes.map { " — \($0)" } ?? ""
+                        notify("CLI update available",
+                               "auto-agent-ai v\(latest) is available (you have v\(installed))." + notes,
+                               kind: .updates)
                     }
                 }
             }
@@ -1423,7 +1741,14 @@ final class StatusStore: ObservableObject {
         guard Date().timeIntervalSince(lastUserAction) > 20 else { return }
         guard Date().timeIntervalSince(lastAutoRestartAt) > 300 else { return } // retry at most every 5 min
         lastAutoRestartAt = Date()
-        runCLI("auto-restart (\(role))", ["login", "--role", role], isAutoRestart: true)
+        var args = ["login", "--role", role]
+        if role == "owner" {
+            // Primary-user login is token-based; without one the CLI would sit
+            // at a prompt our stdin-less subprocess can never answer.
+            guard let token = handshakeToken else { return }
+            args += ["--token", token]
+        }
+        runCLI("auto-restart (\(role))", args, isAutoRestart: true)
     }
 
     func setAutoRestart(_ on: Bool) {
@@ -1433,12 +1758,180 @@ final class StatusStore: ObservableObject {
 
     func login(role: String) {
         savedRole = role
-        runCLI("login (\(role))", ["login", "--role", role], interactive: true)
+        var args = ["login", "--role", role]
+        // The primary user signs in with the session handshake token instead of
+        // the Microsoft browser flow — pass it so the CLI never has to prompt
+        // (our subprocess has no stdin, so a prompt would just hang).
+        if role == "owner" {
+            guard let token = handshakeToken else {
+                lastError = "Signing in as primary user needs the session handshake token — "
+                    + "paste it in the Figma tab (Primary User) first."
+                return
+            }
+            args += ["--token", token]
+        }
+        runCLI("login (\(role))", args, interactive: role != "owner")
     }
+
+    /// Log in with whatever role this machine last used (client unless the CLI
+    /// state says primary user) — what the single Login button does.
+    func loginWithSavedRole() { login(role: status.role ?? savedRole ?? "client") }
+
+    /// Owner only: push this Mac's credential to the session.
     func push() { runCLI("push", ["push"]) }
     func logout() {
         savedRole = nil // user chose to leave — disable auto-restart until next login
         runCLI("logout", ["logout"])
+    }
+
+    // MARK: Figma session
+
+    /// Re-read the Figma accounts signed in on this Mac. Throttled — the CLI
+    /// call decrypts cookies through the Keychain, so we don't poll it blindly;
+    /// it runs when the Figma tab is opened, after an action, or on refresh.
+    func refreshFigma(force: Bool = false) {
+        guard force || Date().timeIntervalSince(lastFigmaScan) > 60 else { return }
+        guard figmaBusy == nil else { return }
+        lastFigmaScan = Date()
+        figmaQueue.async {
+            let state = readFigmaState()
+            DispatchQueue.main.async { self.figma = state }
+        }
+    }
+
+    /// Cheap poll (no CLI call): just whether Figma Desktop is up right now.
+    func refreshFigmaDesktopFlag() {
+        figmaQueue.async {
+            let running = figmaDesktopRunning()
+            DispatchQueue.main.async {
+                if self.figma.desktopRunning != running { self.figma.desktopRunning = running }
+            }
+        }
+    }
+
+    func setFigmaToken(_ token: String) {
+        figmaToken = token
+        UserDefaults.standard.set(token, forKey: "figmaToken")
+    }
+
+    /// Pull the shared Figma login and write it into Figma Desktop.
+    /// Figma must be quit while cookies are written, so we quit it, import,
+    /// and (if we quit it) launch it again so it comes back signed in.
+    func figmaImport() {
+        runFigma("import", ["figma", "import"], needsFigmaQuit: true, relaunchFigma: true)
+    }
+
+    /// Owner/primary user: share this Mac's Figma login with the team.
+    func figmaUpload() {
+        var args = ["figma", "upload"]
+        if let id = figma.activeAccount?.id { args += ["--account", id] }
+        guard let token = handshakeToken else {
+            figmaError = "Uploading needs the session handshake token — paste it above first."
+            return
+        }
+        args += ["--token", token]
+        runFigma("upload", args, needsFigmaQuit: true, relaunchFigma: true)
+    }
+
+    /// Owner/primary user: delete the shared login from the server.
+    func figmaRevoke() {
+        guard let token = handshakeToken else {
+            figmaError = "Revoking needs the session handshake token — paste it above first."
+            return
+        }
+        runFigma("revoke", ["figma", "revoke", "--token", token])
+    }
+
+    /// Sign this Mac out of every shared Figma account (local only).
+    func figmaClearAll() {
+        runFigma("sign out", ["figma", "clear", "--all"], needsFigmaQuit: true)
+    }
+
+    /// Sign one account out (the CLI's `figma clear --account`, which it
+    /// otherwise asks for interactively — we always pass the id).
+    func figmaClear(account: FigmaAccount) {
+        runFigma("sign out", ["figma", "clear", "--account", account.id], needsFigmaQuit: true)
+    }
+
+    func openFigmaDesktop() {
+        let url = URL(fileURLWithPath: figmaAppPath)
+        guard FileManager.default.fileExists(atPath: figmaAppPath) else {
+            figmaError = "Figma Desktop isn't installed in /Applications."
+            return
+        }
+        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { _, _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.refreshFigmaDesktopFlag() }
+        }
+    }
+
+    func quitFigmaDesktopNow() {
+        figmaQueue.async {
+            _ = quitFigmaDesktop()
+            DispatchQueue.main.async { self.refreshFigmaDesktopFlag() }
+        }
+    }
+
+    private func runFigma(_ name: String, _ args: [String],
+                          needsFigmaQuit: Bool = false, relaunchFigma: Bool = false) {
+        guard figmaBusy == nil, busy == nil else { return }
+        guard let cli = cliPath ?? findCLI() else {
+            figmaError = "auto-agent-ai CLI not found. Install it: npm install -g \(cliPackage)"
+            return
+        }
+        figmaBusy = name
+        figmaError = nil
+        figmaQueue.async {
+            // The CLI can't touch the cookie DB while Figma Desktop is open.
+            var quitIt = false
+            if needsFigmaQuit && figmaDesktopRunning() {
+                quitIt = quitFigmaDesktop()
+                if !quitIt {
+                    DispatchQueue.main.async {
+                        self.figmaBusy = nil
+                        self.figmaError = "Figma Desktop wouldn't quit — quit it manually, then try again."
+                    }
+                    return
+                }
+            }
+            let result = runCommand(cli, args, timeout: 180)
+            if relaunchFigma && quitIt && result.code == 0 {
+                let url = URL(fileURLWithPath: figmaAppPath)
+                if FileManager.default.fileExists(atPath: figmaAppPath) {
+                    NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration(),
+                                                       completionHandler: { _, _ in })
+                }
+            }
+            let state = readFigmaState()
+            DispatchQueue.main.async {
+                self.figmaBusy = nil
+                self.figma = state
+                self.lastFigmaScan = Date()
+                self.refreshSessions(force: true) // upload/revoke change hasSession
+                let text = stripANSI(result.output)
+                if result.code != 0 {
+                    if isUpdateRequired(text) { self.cliUpdateRequired = true }
+                    let tail = text.split(separator: "\n").map(String.init)
+                        .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                        .suffix(3).map(stripLogTimestamp).joined(separator: "\n")
+                    self.figmaError = "Figma \(name) failed:\n" + (tail.isEmpty ? "exit \(result.code)" : tail)
+                    return
+                }
+                let who = state.activeAccount?.email
+                switch name {
+                case "import":
+                    notify("Figma signed in",
+                           who.map { "Figma Desktop is signed in as \($0)." }
+                            ?? "The shared Figma login was imported.", kind: .figma)
+                case "upload":
+                    notify("Figma session shared", "Your Figma login was uploaded for the team.", kind: .figma)
+                case "revoke":
+                    notify("Figma session revoked", "The shared Figma login was deleted from the server.", kind: .figma)
+                case "sign out":
+                    notify("Figma signed out", "This Mac was signed out of the shared Figma account.", kind: .figma)
+                default: break
+                }
+            }
+        }
     }
 
     private func runCLI(_ name: String, _ args: [String],
@@ -1671,10 +2164,12 @@ struct ActionButton: View {
 struct ContentView: View {
     @ObservedObject var store: StatusStore
     @State private var confirmLogout = false
+    @State private var confirmFigmaClear = false
+    @State private var switchingToken = false
     @State private var tab: Tab = .status
     @State private var notifExpanded = false
 
-    enum Tab: Hashable { case status, system, settings }
+    enum Tab: Hashable { case status, figma, system, settings }
 
     private static let relFormatter = RelativeDateTimeFormatter()
     private static let absFormatter: DateFormatter = {
@@ -1695,6 +2190,7 @@ struct ContentView: View {
             Group {
                 switch tab {
                 case .status: statusTab
+                case .figma: figmaTab
                 case .system: systemTab
                 case .settings: settingsTab
                 }
@@ -1743,6 +2239,228 @@ struct ContentView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
+    }
+
+    /// Figma session sharing: which account this Mac is signed into, and the
+    /// one-tap import that pulls the team's shared Figma login.
+    private var figmaTab: some View {
+        VStack(spacing: 8) {
+            figmaSharedCard
+            figmaAccountsCard
+            figmaActionsCard
+            if s.isOwner { figmaOwnerCard }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .onAppear {
+            store.refreshFigma()
+            store.refreshSessions()
+        }
+        .confirmationDialog(
+            "Sign out of the shared Figma account?",
+            isPresented: $confirmFigmaClear,
+            titleVisibility: .visible
+        ) {
+            Button("Sign out", role: .destructive) { store.figmaClearAll() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This only removes the login from this Mac — Figma Desktop will be quit first.")
+        }
+    }
+
+    /// What the server has: the Figma session you're assigned to, and whether a
+    /// login has actually been uploaded to it yet.
+    private var figmaSharedCard: some View {
+        Card(title: "Shared Figma Session", icon: "person.2.badge.key.fill") {
+            if let ses = store.figmaSession {
+                InfoRow(icon: "rectangle.stack.fill", label: "Session",
+                        value: ses.memberCount > 0 ? "\(ses.name) · \(ses.memberCount) members" : ses.name,
+                        valueColor: ses.isActive ? .primary : .orange)
+                InfoRow(icon: ses.hasSession ? "checkmark.seal.fill" : "clock.badge.questionmark",
+                        label: "Shared login",
+                        value: ses.hasSession ? (ses.sharedLabel ?? "Available") : "Not uploaded yet",
+                        valueColor: ses.hasSession ? .green : .orange,
+                        help: ses.hasSession
+                            ? "\(ses.cookieCount) cookies uploaded" + (ses.capturedAt.map { " · captured " + Self.absFormatter.string(from: $0) } ?? "")
+                            : "The primary user hasn't uploaded their Figma login to this session yet.")
+                if ses.hasSession, let at = ses.capturedAt {
+                    InfoRow(icon: "clock.arrow.circlepath", label: "Captured",
+                            value: Self.relFormatter.localizedString(for: at, relativeTo: Date()),
+                            valueColor: .secondary)
+                }
+            } else {
+                Text(store.status.role == nil
+                     ? "Log in first — the shared Figma session is read from the server."
+                     : "You're not assigned to a Figma session yet. Ask the session owner to add you.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var figmaAccountsCard: some View {
+        Card(title: "Figma Account", icon: "person.crop.square.filled.and.at.rectangle") {
+            if let problem = store.figma.problem {
+                Text(problem)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if store.figma.accounts.isEmpty {
+                InfoRow(icon: "person.slash", label: "Signed in",
+                        value: store.figma.checked ? "No account" : "Checking…",
+                        valueColor: store.figma.checked ? .secondary : .secondary)
+            } else {
+                VStack(alignment: .leading, spacing: 5) {
+                    ForEach(store.figma.accounts) { acct in
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Image(systemName: acct.active ? "checkmark.seal.fill" : "person.fill")
+                                .font(.system(size: 11))
+                                .foregroundStyle(acct.active ? Color.green : .secondary)
+                                .frame(width: 16)
+                            Text(acct.email)
+                                .font(.callout.weight(.medium))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .help(acct.email)
+                            Spacer(minLength: 8)
+                            if let kind = acct.planKind {
+                                Text(kind.capitalized)
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 5).padding(.vertical, 1)
+                                    .background(.quaternary.opacity(0.7), in: Capsule())
+                            }
+                            // With several accounts signed in, allow signing out
+                            // just one — the CLI's `figma clear --account`.
+                            if store.figma.accounts.count > 1, store.figmaBusy == nil {
+                                Button { store.figmaClear(account: acct) } label: {
+                                    Image(systemName: "person.badge.minus")
+                                        .font(.system(size: 10, weight: .semibold))
+                                        .foregroundStyle(.red)
+                                }
+                                .buttonStyle(.plain)
+                                .help("Sign \(acct.email) out of Figma Desktop")
+                            }
+                        }
+                    }
+                }
+            }
+            InfoRow(icon: "macwindow", label: "Figma Desktop",
+                    value: store.figma.desktopRunning ? "Running" : "Not running",
+                    valueColor: store.figma.desktopRunning ? .orange : .secondary,
+                    help: store.figma.desktopRunning
+                        ? "Figma must be quit while the shared login is written — the app quits and reopens it for you."
+                        : "Ready to import the shared login.")
+        }
+    }
+
+    private var figmaActionsCard: some View {
+        Card(title: "Shared Session", icon: "arrow.down.circle") {
+            if let busy = store.figmaBusy {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(figmaBusyText(busy))
+                        .font(.callout).foregroundStyle(.secondary)
+                        .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 8)
+            } else {
+                Text(figmaHint)
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                // Two primary actions only — refresh lives in the footer, and
+                // signing out is the rare, destructive one (small link below).
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                    // Mirrors the CLI: importing is only offered once a login
+                    // has actually been uploaded to your assigned session.
+                    ActionButton(title: "Import login", icon: "square.and.arrow.down.fill", color: .purple,
+                                 disabled: store.cliPath == nil || !store.canImportFigma) { store.figmaImport() }
+                    ActionButton(title: "Open Figma", icon: "paintpalette.fill", color: .blue) {
+                        store.openFigmaDesktop()
+                    }
+                }
+                if !store.figma.accounts.isEmpty {
+                    Button("Sign out of Figma on this Mac") { confirmFigmaClear = true }
+                        .buttonStyle(.plain)
+                        .font(.caption2)
+                        .foregroundStyle(.red.opacity(0.85))
+                        .padding(.top, 1)
+                }
+            }
+            if let err = store.figmaError {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 10)).foregroundStyle(.red)
+                    Text(err)
+                        .font(.caption2).lineLimit(4).help(err)
+                    Spacer(minLength: 2)
+                    Button { store.figmaError = nil } label: {
+                        Image(systemName: "xmark").font(.system(size: 8, weight: .bold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.top, 2)
+            }
+        }
+    }
+
+    /// Primary-user (owner) side: publish or revoke the shared login. Both need
+    /// the per-session handshake token from the web dashboard.
+    private var figmaOwnerCard: some View {
+        Card(title: "Primary User", icon: "person.badge.key.fill") {
+            if s.handshakeToken != nil && !switchingToken {
+                HStack(spacing: 6) {
+                    Text("Using the session token from your CLI login.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                    Spacer(minLength: 4)
+                    // The CLI's "Switch session token" menu entry.
+                    Button("Switch") { switchingToken = true }
+                        .buttonStyle(.plain)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(Color.accentColor)
+                }
+            } else {
+                SecureField("Handshake token", text: Binding(
+                    get: { store.figmaToken },
+                    set: { store.setFigmaToken($0) }))
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+            }
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                ActionButton(title: "Share login", icon: "square.and.arrow.up.fill", color: .teal,
+                             disabled: store.figmaBusy != nil || store.figma.accounts.isEmpty
+                                       || store.handshakeToken == nil) {
+                    store.figmaUpload()
+                }
+                ActionButton(title: "Revoke", icon: "trash.fill", color: .orange,
+                             disabled: store.figmaBusy != nil || store.handshakeToken == nil
+                                       || store.figmaSession?.hasSession != true) { store.figmaRevoke() }
+            }
+        }
+    }
+
+    private var figmaHint: String {
+        guard let ses = store.figmaSession else {
+            return "No Figma session is assigned to you, so there's nothing to import yet."
+        }
+        if !ses.hasSession {
+            return "\(ses.name) has no login uploaded yet — the primary user has to share theirs first."
+        }
+        if let local = store.figma.activeAccount?.email, local == ses.accounts.first?.email {
+            return "This Mac is already signed in as \(local). Import again to refresh the cookies."
+        }
+        return "Pull \(ses.sharedLabel ?? ses.name) into Figma Desktop on this Mac."
+    }
+
+    private func figmaBusyText(_ busy: String) -> String {
+        switch busy {
+        case "import": return "Importing the shared login… Figma will reopen signed in."
+        case "upload": return "Sharing this Mac's Figma login…"
+        case "revoke": return "Revoking the shared login…"
+        default: return "Signing out of Figma…"
+        }
     }
 
     private var systemTab: some View {
@@ -1852,6 +2570,8 @@ struct ContentView: View {
                 store.checkVersions(force: true)
                 store.refreshUsage(force: true)
                 store.refreshPlanUsage(force: true)
+                store.refreshSessions(force: true)
+                if tab == .figma { store.refreshFigma(force: true) }
             }
             footerButton("doc.text", help: "Open watch log") { store.openLog() }
             Spacer()
@@ -1936,6 +2656,14 @@ struct ContentView: View {
         Card(title: "Credential", icon: "person.badge.key.fill") {
             InfoRow(icon: "person.fill", label: "Role", value: roleText)
             InfoRow(icon: "clock.fill", label: "Token", value: expiry.text, valueColor: expiry.color)
+            if let ses = store.aiSession {
+                InfoRow(icon: "rectangle.stack.fill", label: "Session",
+                        value: ses.members.count > 1 ? "\(ses.name) · \(ses.members.count) members" : ses.name,
+                        valueColor: ses.isActive ? .primary : .orange,
+                        help: ses.members.isEmpty
+                            ? ses.name
+                            : "\(ses.name) — shared with: " + ses.members.joined(separator: ", "))
+            }
         }
     }
 
@@ -2133,6 +2861,12 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 }
             } else if updateAvailable, let latest = store.latestVersion {
+                if let notes = store.cliReleaseNotes {
+                    Text(notes)
+                        .font(.caption2).foregroundStyle(.secondary)
+                        .lineLimit(3).help(notes)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 ActionButton(title: "Update CLI to v\(latest)", icon: "arrow.down.circle.fill",
                              color: .orange) { store.updateCLI() }
             }
@@ -2185,9 +2919,15 @@ struct ContentView: View {
             } else {
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
                     ActionButton(title: "Login", icon: "person.fill", color: .teal,
-                                 disabled: store.cliPath == nil) { store.login(role: "client") }
+                                 disabled: store.cliPath == nil) { store.loginWithSavedRole() }
                     ActionButton(title: "Logout", icon: "rectangle.portrait.and.arrow.right", color: .red,
                                  disabled: store.cliPath == nil) { confirmLogout = true }
+                    // Primary user only — the CLI's "Push" menu entry: send this
+                    // Mac's credential up so the assigned clients pull it.
+                    if s.isOwner {
+                        ActionButton(title: "Push credential", icon: "arrow.up.circle.fill", color: .indigo,
+                                     disabled: store.cliPath == nil) { store.push() }
+                    }
                 }
             }
         }
@@ -2201,10 +2941,17 @@ struct ContentView: View {
                 Text("CLI update required")
                     .font(.callout.weight(.semibold))
             }
-            Text("auto-agent-ai is blocked until it's updated — login, push and the watcher won't work until you update.")
+            Text("auto-agent-ai is blocked until it's updated — login, push, Figma and the watcher won't work until you update.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            if let notes = store.cliReleaseNotes {
+                Text(notes)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(4).help(notes)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if store.updatingCLI {
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.mini)
@@ -2456,17 +3203,18 @@ struct TabSwitcher: View {
 
     private let tabs: [(tab: ContentView.Tab, icon: String, label: String)] = [
         (.status, "key.fill", "Status"),
+        (.figma, "paintpalette.fill", "Figma"),
         (.system, "server.rack", "System"),
         (.settings, "slider.horizontal.3", "Settings"),
     ]
 
     var body: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 2) {
             ForEach(tabs, id: \.tab) { item in
                 segment(item.tab, item.icon, item.label)
             }
         }
-        .padding(4)
+        .padding(3)
         .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -2479,11 +3227,13 @@ struct TabSwitcher: View {
         return Button {
             withAnimation(.spring(response: 0.32, dampingFraction: 0.78)) { selection = tab }
         } label: {
-            HStack(spacing: 6) {
+            HStack(spacing: 4) {
                 Image(systemName: icon)
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: 10, weight: .semibold))
                 Text(label)
-                    .font(.callout.weight(.semibold))
+                    .font(.system(size: 12, weight: .semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 6)
