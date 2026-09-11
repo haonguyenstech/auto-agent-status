@@ -688,6 +688,104 @@ func pushUsageReport(server: String, role: String?, today: TokenUsage,
     _ = sem.wait(timeout: .now() + 14)
 }
 
+// MARK: - Token Rank (team leaderboard)
+
+// A small self-hosted board (token-rank on the team VPS) that ranks everyone's
+// Claude Code token usage. The company server collects the same numbers but
+// only serves them back to admins, so each app reports its own totals here
+// instead. Reading the board is open; writing needs the shared team key.
+//
+// Everything sent is what this Mac already computed for its own Usage card —
+// no transcript text, no prompts, just the counters and the username the CLI
+// already logged in with.
+
+let tokenRankDefaultURL = "http://116.118.6.26:8099"
+
+/// The signed-in username straight from the CLI's state.json.
+///
+/// `status.username` comes from the same file but only after the status poll
+/// has finished, and that poll shells out to pgrep/security/curl — several
+/// seconds. The usage scan finishes first on a warm cache, so reading the file
+/// here is what keeps the very first report of a launch from being dropped.
+/// The display name the server knows this account by ("Hao.Nguyen"), from the
+/// identity block the CLI caches at login. Nicer on the board than the raw
+/// username, and it costs one local file read.
+func readAgentDisplayName() -> String? {
+    guard let d = FileManager.default.contents(atPath: "\(agentHome)/.config.json"),
+          let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+          let auth = obj["auth"] as? [String: Any],
+          let user = auth["user"] as? [String: Any],
+          let name = user["displayName"] as? String, !name.isEmpty else { return nil }
+    return name
+}
+
+func readStateUsername() -> String? {
+    guard let d = FileManager.default.contents(atPath: statePath),
+          let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+          let u = obj["username"] as? String, !u.isEmpty else { return nil }
+    return u
+}
+
+/// Day/period buckets in the shape the board expects.
+private func rankBucket(_ billable: Int, _ cost: Double) -> [String: Any] {
+    ["billable": billable, "costUsd": cost]
+}
+
+/// POST this Mac's usage to the leaderboard. Best-effort and silent: a board
+/// that is down must never be visible in the menu bar.
+func pushTokenRank(base: String, key: String, username: String, displayName: String?,
+                   session: String?, today: TokenUsage, history: [DayUsage],
+                   totals: PeriodTotals?) -> Bool {
+    let trimmed = base.hasSuffix("/") ? String(base.dropLast()) : base
+    guard !key.isEmpty, !username.isEmpty,
+          let url = URL(string: "\(trimmed)/api/report") else { return false }
+
+    let day = DateFormatter()
+    day.locale = Locale(identifier: "en_US_POSIX")
+    day.dateFormat = "yyyy-MM-dd"
+    let month = DateFormatter()
+    month.locale = Locale(identifier: "en_US_POSIX")
+    month.dateFormat = "yyyy-MM"
+
+    var historyPayload: [String: Any] = [:]
+    for d in history {
+        historyPayload[day.string(from: d.date)] = rankBucket(d.billable, d.costUSD)
+    }
+    var body: [String: Any] = [
+        "username": username,
+        "displayName": displayName ?? username,
+        "app": appVersion,
+        "todayDate": day.string(from: Date()),
+        "today": ["billable": today.billable, "input": today.input, "output": today.output,
+                  "cacheCreate": today.cacheCreate, "cacheRead": today.cacheRead,
+                  "costUsd": today.costUSD],
+        "history": historyPayload,
+    ]
+    if let session { body["session"] = session }
+    if let t = totals {
+        body["monthKey"] = month.string(from: Date())
+        body["month"] = rankBucket(t.monthBillable, t.monthCost)
+        body["allTime"] = rankBucket(t.allBillable, t.allCost)
+    }
+    guard let data = try? JSONSerialization.data(withJSONObject: body) else { return false }
+
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.timeoutInterval = 12
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.setValue(key, forHTTPHeaderField: "X-Team-Key")
+    req.httpBody = data
+
+    var ok = false
+    let sem = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: req) { _, resp, _ in
+        defer { sem.signal() }
+        if let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) { ok = true }
+    }.resume()
+    _ = sem.wait(timeout: .now() + 14)
+    return ok
+}
+
 // MARK: - auto-agent server API (same base + auth the CLI uses)
 
 /// GET `{server}/api/v1/<path>` with the CLI's stored session token and its
@@ -1391,6 +1489,15 @@ final class StatusStore: ObservableObject {
         ?? UserDefaults.standard.object(forKey: "autoRestart") as? Bool ?? true
     /// When the app last renewed the credential by itself.
     @Published var lastRenewAt: Date?
+    /// Share this Mac's token totals with the team leaderboard. Off until the
+    /// user turns it on — it publishes their numbers to a board their
+    /// teammates can see, which is theirs to opt into, not ours to assume.
+    @Published var shareTokenRank = UserDefaults.standard.bool(forKey: "shareTokenRank")
+    @Published var tokenRankURL = UserDefaults.standard.string(forKey: "tokenRankURL") ?? tokenRankDefaultURL
+    @Published var tokenRankKey = UserDefaults.standard.string(forKey: "tokenRankKey") ?? ""
+    /// Outcome of the last push, for the Settings row: nil = never tried.
+    @Published var tokenRankOK: Bool?
+    @Published var tokenRankAt: Date?
     @Published var installedVersion: String?
     @Published var latestVersion: String?
     @Published var updatingCLI = false
@@ -1704,6 +1811,9 @@ final class StatusStore: ObservableObject {
                     pushUsageReport(server: server, role: role,
                                     today: report.today, models: report.todayModels)
                 }
+                // …and to the team leaderboard, if the user opted in.
+                self.pushRank(today: report.today, history: report.history,
+                              totals: report.totals)
             }
         }
     }
@@ -1716,6 +1826,42 @@ final class StatusStore: ObservableObject {
         usageQueue.async {
             guard let plan = fetchPlanUsage() else { return }
             DispatchQueue.main.async { self.planUsage = plan }
+        }
+    }
+
+    func setShareTokenRank(_ on: Bool) {
+        shareTokenRank = on
+        UserDefaults.standard.set(on, forKey: "shareTokenRank")
+        if on { refreshUsage(force: true) } else { tokenRankOK = nil }
+    }
+
+    func setTokenRankURL(_ v: String) {
+        tokenRankURL = v
+        UserDefaults.standard.set(v, forKey: "tokenRankURL")
+    }
+
+    func setTokenRankKey(_ v: String) {
+        tokenRankKey = v
+        UserDefaults.standard.set(v, forKey: "tokenRankKey")
+        if shareTokenRank { refreshUsage(force: true) }
+    }
+
+    /// Push whatever the Usage card is currently showing, off the main thread.
+    private func pushRank(today: TokenUsage, history: [DayUsage], totals: PeriodTotals?) {
+        guard shareTokenRank, !tokenRankKey.isEmpty,
+              let username = status.username ?? readStateUsername() else { return }
+        let base = tokenRankURL, key = tokenRankKey
+        let display = readAgentDisplayName() ?? username
+        let session = aiSession?.name
+        usageQueue.async {
+            let ok = pushTokenRank(base: base, key: key, username: username,
+                                   displayName: display, session: session,
+                                   today: today, history: history, totals: totals)
+            NSLog("token-rank: push %@ as %@ -> %@", base, username, ok ? "ok" : "failed")
+            DispatchQueue.main.async {
+                self.tokenRankOK = ok
+                if ok { self.tokenRankAt = Date() }
+            }
         }
     }
 
@@ -2631,6 +2777,7 @@ struct ContentView: View {
                 title: "Start at Login",
                 subtitle: "Launch automatically on sign-in",
                 isOn: Binding(get: { store.launchAtLogin }, set: { store.setLaunchAtLogin($0) }))
+            TokenRankSection(store: store)
             notificationsSection
             AboutSection(store: store)
                 .padding(.top, 4)
@@ -3421,6 +3568,58 @@ struct TabSwitcher: View {
 }
 
 /// A polished settings row: tinted icon tile, title + subtitle, and a switch.
+/// Opt-in sharing to the team leaderboard. The key field only appears once the
+/// switch is on — until then this is one quiet row like every other setting.
+struct TokenRankSection: View {
+    @ObservedObject var store: StatusStore
+
+    var body: some View {
+        VStack(spacing: 4) {
+            SettingToggle(
+                icon: "trophy.fill", tint: .yellow,
+                title: "Share usage to Token Rank",
+                subtitle: statusLine,
+                isOn: Binding(get: { store.shareTokenRank },
+                              set: { store.setShareTokenRank($0) }))
+
+            if store.shareTokenRank {
+                HStack(spacing: 6) {
+                    SecureField("Team key", text: Binding(
+                        get: { store.tokenRankKey },
+                        set: { store.setTokenRankKey($0) }))
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                    Button {
+                        if let url = URL(string: store.tokenRankURL) { NSWorkspace.shared.open(url) }
+                    } label: {
+                        Image(systemName: "arrow.up.right.square.fill")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.accentColor)
+                    .help("Open the leaderboard — \(store.tokenRankURL)")
+                }
+                .padding(.leading, 36)
+                .padding(.trailing, 2)
+            }
+        }
+    }
+
+    /// Doubles as the result of the last push, so a wrong key is visible here
+    /// rather than only in a board that silently never updates.
+    private var statusLine: String {
+        guard store.shareTokenRank else { return "Rank your tokens against the team" }
+        if store.tokenRankKey.isEmpty { return "Paste the team key to start reporting" }
+        switch store.tokenRankOK {
+        case .some(true):
+            guard let at = store.tokenRankAt else { return "Reporting" }
+            let f = DateFormatter(); f.dateFormat = "HH:mm"
+            return "Last reported at \(f.string(from: at))"
+        case .some(false): return "Last report failed — check the key or the server"
+        case nil: return "Reporting on the next usage scan"
+        }
+    }
+}
+
 struct SettingToggle: View {
     let icon: String
     let tint: Color

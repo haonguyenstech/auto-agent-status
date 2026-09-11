@@ -25,6 +25,8 @@ credential status at a glance, without ever opening a terminal.
   sign-in required, Figma session imported, back to normal
 - 🔄 **Auto-renew** — pulls a fresh credential ~10 min before the token expires
   automatically with your last role (toggleable)
+- 🏆 **Token Rank** — opt-in: share your token totals with the team leaderboard
+  (`token-rank` on the team VPS) and see where you place
 - ⬆️ **Auto-updates** — the app updates itself from this repo's Releases
   ("Update App" button), and offers to update the CLI when a new version ships.
   The CLI check uses the server's own version gate (`/app-versions/check`), so

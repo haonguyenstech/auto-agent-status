@@ -15,9 +15,24 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.16.0</string>
+	<string>1.17.0</string>
 	<key>CFBundleVersion</key>
-	<string>1.16.0</string>
+	<string>1.17.0</string>
+	<!-- The Token Rank board is served over plain HTTP from a bare IP, so ATS
+	     would refuse the report with no error the app can see. The exception is
+	     scoped to that one host: everything else still goes through ATS. Point
+	     the board at a different http:// host and this list has to name it too. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSExceptionDomains</key>
+		<dict>
+			<key>116.118.6.26</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+			</dict>
+		</dict>
+	</dict>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSUIElement</key>
