@@ -16,6 +16,10 @@ let agentHome = ProcessInfo.processInfo.environment["AUTO_AGENT_AI_HOME"] ?? "\(
 let statePath = "\(agentHome)/state.json"
 let logPath = "\(agentHome)/watch.log"
 let keychainService = "Claude Code-credentials"
+/// How long before expiry the app re-runs `login` to refresh the credential.
+/// Wide enough that a 30s status poll can never overshoot it, narrow enough
+/// that a healthy token is left alone.
+let renewLeadSeconds: TimeInterval = 10 * 60
 let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
 let updateRepo = "haonguyenstech/autoagent-status" // private repo with release zips
 let installedAppPath = "\(home)/Applications/AutoAgent Status.app"
@@ -540,9 +544,11 @@ func readUsageReport(days: Int = 7) -> (today: TokenUsage, history: [DayUsage], 
 // natively: same payload, same 5-minute cadence (driven by `refreshUsage`).
 //
 // Auth uses the server session token the CLI stores in ~/.auto-agent-ai/
-// .config.json (`auth.accessToken`), which the running watcher keeps refreshed.
-// This is client-only — the owner role uses a different, watcher-driven endpoint
-// (/usage/by-token/claude-usage) that we don't touch.
+// .config.json (`auth.accessToken`). It lives ~15 minutes and used to be kept
+// alive as a side effect of the watcher's own requests; with the watcher gone
+// the app refreshes it itself (`agentAuthToken`). This is client-only — the
+// owner role uses a different endpoint (/usage/by-token/claude-usage) that we
+// don't touch.
 
 /// The auto-agent-ai server session access token, if present.
 func readAgentAuthToken() -> String? {
@@ -551,6 +557,79 @@ func readAgentAuthToken() -> String? {
           let auth = obj["auth"] as? [String: Any],
           let tok = auth["accessToken"] as? String, !tok.isEmpty else { return nil }
     return tok
+}
+
+/// Seconds until the `exp` claim of a JWT, or nil if it has none we can read.
+func jwtSecondsLeft(_ token: String) -> TimeInterval? {
+    let parts = token.split(separator: ".")
+    guard parts.count >= 2 else { return nil }
+    var b64 = String(parts[1]).replacingOccurrences(of: "-", with: "+")
+        .replacingOccurrences(of: "_", with: "/")
+    b64 += String(repeating: "=", count: (4 - b64.count % 4) % 4)
+    guard let d = Data(base64Encoded: b64),
+          let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+          let exp = obj["exp"] as? Double else { return nil }
+    return exp - Date().timeIntervalSince1970
+}
+
+/// Trade the stored refresh token for a fresh pair, exactly as the CLI's 401
+/// interceptor does (`POST /api/v1/auth/refresh`), and write both back.
+///
+/// The server ROTATES refresh tokens: whoever refreshes last owns the session.
+/// So this must never run while a CLI countdown session is up — the two would
+/// invalidate each other and sign the user out. `agentAuthToken` enforces that.
+@discardableResult
+func refreshAgentAuthToken(server: String) -> Bool {
+    let path = "\(agentHome)/.config.json"
+    guard let d = FileManager.default.contents(atPath: path),
+          var obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+          var auth = obj["auth"] as? [String: Any],
+          let refresh = auth["refreshToken"] as? String, !refresh.isEmpty else { return false }
+    let base = server.hasSuffix("/") ? String(server.dropLast()) : server
+    guard let url = URL(string: "\(base)/api/v1/auth/refresh") else { return false }
+
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.timeoutInterval = 12
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.setValue(installedCLIVersion() ?? appVersion, forHTTPHeaderField: "X-Client-Version")
+    req.httpBody = try? JSONSerialization.data(withJSONObject: ["refreshToken": refresh])
+
+    var pair: (access: String, refresh: String)?
+    let sem = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: req) { data, resp, _ in
+        defer { sem.signal() }
+        guard let data, let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let payload = root["data"] as? [String: Any],
+              let access = payload["accessToken"] as? String,
+              let newRefresh = payload["refreshToken"] as? String else { return }
+        pair = (access, newRefresh)
+    }.resume()
+    _ = sem.wait(timeout: .now() + 14)
+    guard let pair else { return false }
+
+    auth["accessToken"] = pair.access
+    auth["refreshToken"] = pair.refresh
+    obj["auth"] = auth
+    guard let out = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]) else { return false }
+    // Write through a temp file so a crash can't leave a half-written config
+    // that would log the user out of the CLI too.
+    let tmp = path + ".tmp"
+    guard (try? out.write(to: URL(fileURLWithPath: tmp), options: .atomic)) != nil else { return false }
+    try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp)
+    _ = try? FileManager.default.replaceItemAt(URL(fileURLWithPath: path), withItemAt: URL(fileURLWithPath: tmp))
+    return true
+}
+
+/// The session token to call the server with, refreshed first if it's about to
+/// lapse. Skips the refresh while a CLI countdown session is running, since
+/// that one rotates the same token.
+func agentAuthToken(server: String) -> String? {
+    guard let token = readAgentAuthToken() else { return nil }
+    let left = jwtSecondsLeft(token) ?? .greatestFiniteMagnitude
+    guard left < 60, findCountdownPid() == nil else { return token }
+    return refreshAgentAuthToken(server: server) ? readAgentAuthToken() : token
 }
 
 /// Claude Code's configured effort level (`~/.claude/settings.json`), if any.
@@ -571,14 +650,12 @@ private func reportDateString() -> String {
 }
 
 /// POST today's usage to the server. No-op for the owner role (uses a different
-/// endpoint) or when logged out / no auth token. On 401 we simply skip — the
-/// watcher refreshes the stored token within ~30s, so the next cycle succeeds;
-/// we deliberately don't rewrite the CLI's .config.json to avoid racing its
-/// refresh-token rotation. Best-effort and silent, like the CLI's uploader.
+/// endpoint) or when logged out / no auth token. Best-effort and silent, like
+/// the CLI's uploader — a failed cycle just waits for the next one.
 func pushUsageReport(server: String, role: String?, today: TokenUsage,
                      models: [String: ModelAgg]) {
     guard let role, role != "owner" else { return }
-    guard let token = readAgentAuthToken() else { return }
+    guard let token = agentAuthToken(server: server) else { return }
     let base = server.hasSuffix("/") ? String(server.dropLast()) : server
     guard let url = URL(string: "\(base)/api/v1/usage/me") else { return }
 
@@ -616,7 +693,7 @@ func pushUsageReport(server: String, role: String?, today: TokenUsage,
 /// GET `{server}/api/v1/<path>` with the CLI's stored session token and its
 /// `X-Client-Version` header. Returns the unwrapped `data` field, or nil.
 func agentAPIGet(_ path: String, server: String) -> Any? {
-    guard let token = readAgentAuthToken() else { return nil }
+    guard let token = agentAuthToken(server: server) else { return nil }
     let base = server.hasSuffix("/") ? String(server.dropLast()) : server
     guard let url = URL(string: "\(base)/api/v1/\(path)") else { return nil }
     var req = URLRequest(url: url)
@@ -851,8 +928,13 @@ func notify(_ title: String, _ body: String, kind: NotifKind) {
 // MARK: - Status model
 
 struct AgentStatus {
-    var watcherRunning = false
-    var watcherPid: Int?
+    /// A CLI countdown session is holding the credential current in a terminal
+    /// of its own. Up to CLI 1.1.16 this was the detached `__watch` process the
+    /// app spawned; from 1.1.20 that mode is gone and `login` only renders the
+    /// countdown when its stdin is a TTY — so this is now purely informational
+    /// (the app does the renewing itself, see `maybeAutoRenew`).
+    var countdownRunning = false
+    var countdownPid: Int?
     var credentialPresent = false
     var expiresAt: Date?
     var role: String?
@@ -875,18 +957,21 @@ struct AgentStatus {
 
     enum State { case active, warning, inactive }
 
+    /// What matters is the credential Claude Code actually reads: if it is in
+    /// the Keychain and unexpired, this Mac is working. Nothing else — no
+    /// helper process — has to be alive for that to be true.
     var state: State {
-        if watcherRunning && credentialValid { return .active }
-        if watcherRunning || credentialPresent { return .warning }
+        if credentialValid { return .active }
+        if credentialPresent || countdownRunning { return .warning }
         return .inactive
     }
 
     var headline: String {
-        switch (watcherRunning, credentialValid, credentialPresent) {
-        case (true, true, _): return "Credential synced and watching"
-        case (true, false, true): return "Credential expired — watcher syncing"
-        case (true, false, false): return "Watcher running — waiting for credential"
-        case (false, _, true): return "Watcher stopped — credential present"
+        switch (credentialValid, credentialPresent, countdownRunning) {
+        case (true, _, true): return "Credential synced — countdown running"
+        case (true, _, false): return "Credential synced and up to date"
+        case (false, true, _): return "Credential expired — renewing"
+        case (false, false, true): return "Signing in…"
         default: return "Logged out"
         }
     }
@@ -916,14 +1001,37 @@ struct AgentStatus {
     }
 }
 
+/// A CLI session that keeps the credential current on its own, if one is up.
+///
+/// Two shapes, because the CLI changed underneath us:
+///   * up to 1.1.16 — the detached `auto-agent-ai __watch` process;
+///   * from 1.1.20 — `auto-agent-ai login` in a terminal, which only renders
+///     the renewing countdown when `process.stdin.isTTY`.
+/// The TTY test is what keeps this from matching the app's own stdin-less
+/// `login` child, which just pulls the credential once and exits.
+func findCountdownPid() -> Int? {
+    let legacy = runCommand("/usr/bin/pgrep", ["-f", "auto-agent-ai __watch"], timeout: 5)
+    if legacy.code == 0, let first = legacy.output.split(separator: "\n").first, let pid = Int(first) {
+        return pid
+    }
+    let live = runCommand("/usr/bin/pgrep", ["-f", "auto-agent-ai login"], timeout: 5)
+    guard live.code == 0 else { return nil }
+    for line in live.output.split(separator: "\n") {
+        guard let pid = Int(line.trimmingCharacters(in: .whitespaces)) else { continue }
+        let tty = runCommand("/bin/ps", ["-o", "tty=", "-p", String(pid)], timeout: 5)
+        let name = tty.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if tty.code == 0, !name.isEmpty, name != "??" { return pid }
+    }
+    return nil
+}
+
 func readStatus() -> AgentStatus {
     var s = AgentStatus()
 
-    // 1. Background watcher process
-    let pg = runCommand("/usr/bin/pgrep", ["-f", "auto-agent-ai __watch"], timeout: 5)
-    if pg.code == 0, let first = pg.output.split(separator: "\n").first, let pid = Int(first) {
-        s.watcherRunning = true
-        s.watcherPid = pid
+    // 1. A CLI countdown session running outside this app, if any.
+    if let pid = findCountdownPid() {
+        s.countdownRunning = true
+        s.countdownPid = pid
     }
 
     // 2. Local state written by the CLI
@@ -1275,7 +1383,14 @@ final class StatusStore: ObservableObject {
     @Published var busy: String?
     @Published var lastError: String?
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
-    @Published var autoRestart = UserDefaults.standard.object(forKey: "autoRestart") as? Bool ?? true
+    /// Keep the Keychain credential fresh by re-running `login` as it nears
+    /// expiry — what the CLI's countdown screen does, driven from here instead.
+    /// Inherits the old "autoRestart" switch so nobody who turned it off gets
+    /// it back on after updating.
+    @Published var autoRenew = UserDefaults.standard.object(forKey: "autoRenew") as? Bool
+        ?? UserDefaults.standard.object(forKey: "autoRestart") as? Bool ?? true
+    /// When the app last renewed the credential by itself.
+    @Published var lastRenewAt: Date?
     @Published var installedVersion: String?
     @Published var latestVersion: String?
     @Published var updatingCLI = false
@@ -1332,13 +1447,18 @@ final class StatusStore: ObservableObject {
     @Published var keepAwake = false
     @Published var keepAwakeHours = UserDefaults.standard.object(forKey: "keepAwakeHours") as? Int ?? 2
     @Published var keepAwakeUntil: Date?
-    /// Keep the Mac awake automatically whenever the watcher is running.
+    /// Keep the Mac awake automatically whenever a credential is being kept
+    /// current — asleep, the app can't re-run `login` when the token expires.
     @Published var autoAwakeWithWatcher = UserDefaults.standard.bool(forKey: "autoAwakeWithWatcher")
     /// Selectable durations (hours); 0 means "until I turn it off".
     let keepAwakeOptions = [2, 4, 6, 8, 10, 12]
 
-    /// The Mac is being held awake — manually, or automatically while the watcher runs.
-    var isStayingAwake: Bool { keepAwake || (autoAwakeWithWatcher && status.watcherRunning) }
+    /// The Mac is being held awake — manually, or automatically while a
+    /// credential is live and something is keeping it that way.
+    var isStayingAwake: Bool {
+        keepAwake || (autoAwakeWithWatcher && status.credentialPresent
+                      && (autoRenew || status.countdownRunning))
+    }
 
     /// Lid-closed (clamshell) keep-awake: run with the lid shut, no external
     /// display needed. Session-scoped — reverted on quit for safety.
@@ -1356,7 +1476,7 @@ final class StatusStore: ObservableObject {
     private var lastPlanFetch = Date.distantPast
     private var hasStatus = false
     private var lastUserAction = Date.distantPast
-    private var lastAutoRestartAt = Date.distantPast
+    private var lastAutoRenewAt = Date.distantPast
 
     private let sleepGuard = SleepGuard()
     private var keepAwakeTimer: DispatchWorkItem?
@@ -1695,8 +1815,8 @@ final class StatusStore: ObservableObject {
         if let role = new.role { savedRole = role }
         if let old { notifyTransitions(old: old, new: new) }
         checkExpiryWarnings(new)
-        syncSleepGuard() // watcher may have started/stopped → auto-awake follows
-        maybeAutoRestart(new)
+        syncSleepGuard() // credential may have come or gone → auto-awake follows
+        maybeAutoRenew(new)
     }
 
     /// Warn once at each threshold (30/15/5 min) before the credential expires.
@@ -1713,34 +1833,41 @@ final class StatusStore: ObservableObject {
         let crossed = expiryThresholds.filter { Double($0) >= minsLeft }
         guard let warn = crossed.min(), !firedExpiryWarnings.contains(warn) else { return }
         firedExpiryWarnings.formUnion(crossed)
-        let tail = s.watcherRunning ? " The watcher will try to renew it." : ""
+        let tail = (autoRenew || s.countdownRunning) ? " It will be renewed automatically." : ""
         notify("Token expiring soon", "Your Claude Code token expires in about \(warn) min.\(tail)", kind: .credential)
     }
 
     private func notifyTransitions(old: AgentStatus, new: AgentStatus) {
         // Don't notify about changes the user just caused (login/logout clicks).
         let userJustActed = Date().timeIntervalSince(lastUserAction) < 20
-        if old.watcherRunning && !new.watcherRunning && !userJustActed {
-            notify("Watcher stopped", "The auto-agent watcher is no longer running.", kind: .watcher)
-        }
         if old.credentialPresent && !new.credentialPresent && !userJustActed {
             notify("Credential removed", "The Claude Code credential was wiped from your Keychain.", kind: .credential)
         }
-        if old.credentialValid && !new.credentialValid && new.credentialPresent && !new.watcherRunning {
-            notify("Token expired", "The token expired and no watcher is running to renew it.", kind: .credential)
+        if old.credentialValid && !new.credentialValid && new.credentialPresent
+            && !autoRenew && !new.countdownRunning {
+            notify("Token expired", "The token expired and auto-renew is off — log in to refresh it.", kind: .credential)
         }
         if old.state != .active && new.state == .active {
-            notify("AutoAgent active", "Credential synced and watcher running.", kind: .credential)
+            notify("AutoAgent active", "Credential synced and up to date.", kind: .credential)
         }
     }
 
-    /// Self-healing: if the watcher died but we know the last role, log in again.
-    private func maybeAutoRestart(_ s: AgentStatus) {
-        guard autoRestart, busy == nil, !s.watcherRunning else { return }
+    /// Renew the credential before it lapses, the way the CLI's countdown
+    /// screen would — `login` pulls whatever the session currently holds and
+    /// writes it to the Keychain, so re-running it near expiry is the renewal.
+    ///
+    /// Only fires inside the lead window: with no watcher process to miss any
+    /// more, running `login` on any other schedule is pure noise.
+    private func maybeAutoRenew(_ s: AgentStatus) {
+        guard autoRenew, busy == nil, !s.countdownRunning else { return }
+        guard s.credentialPresent || s.role != nil else { return } // never logged in here
         guard let role = s.role ?? savedRole else { return }
+        // Expired, or close enough to expiry to be worth a pull.
+        let secondsLeft = s.expiresAt?.timeIntervalSinceNow ?? 0
+        guard secondsLeft < renewLeadSeconds else { return }
         guard Date().timeIntervalSince(lastUserAction) > 20 else { return }
-        guard Date().timeIntervalSince(lastAutoRestartAt) > 300 else { return } // retry at most every 5 min
-        lastAutoRestartAt = Date()
+        guard Date().timeIntervalSince(lastAutoRenewAt) > 300 else { return } // at most every 5 min
+        lastAutoRenewAt = Date()
         var args = ["login", "--role", role]
         if role == "owner" {
             // Primary-user login is token-based; without one the CLI would sit
@@ -1748,12 +1875,18 @@ final class StatusStore: ObservableObject {
             guard let token = handshakeToken else { return }
             args += ["--token", token]
         }
-        runCLI("auto-restart (\(role))", args, isAutoRestart: true)
+        runCLI("auto-renew (\(role))", args, isAutoRestart: true)
     }
 
-    func setAutoRestart(_ on: Bool) {
-        autoRestart = on
-        UserDefaults.standard.set(on, forKey: "autoRestart")
+    func setAutoRenew(_ on: Bool) {
+        autoRenew = on
+        UserDefaults.standard.set(on, forKey: "autoRenew")
+    }
+
+    /// When the credential is due for renewal, if auto-renew can do it.
+    var nextRenewAt: Date? {
+        guard autoRenew, !status.countdownRunning, let exp = status.expiresAt else { return nil }
+        return exp.addingTimeInterval(-renewLeadSeconds)
     }
 
     func login(role: String) {
@@ -1963,7 +2096,7 @@ final class StatusStore: ObservableObject {
                     abortedForAuth = true
                     DispatchQueue.main.async {
                         notify("Sign-in required",
-                               "The watcher needs you to sign in again — open AutoAgent and click Owner or Client Login.",
+                               "Auto-renew needs you to sign in again — open AutoAgent and click Owner or Client Login.",
                                kind: .signIn)
                     }
                     return true // abort the hung process
@@ -2006,10 +2139,11 @@ final class StatusStore: ObservableObject {
                 } else {
                     self.cliUpdateRequired = false
                     if isAutoRestart {
-                        notify("Watcher restarted", "Watcher was down — logged in again automatically.", kind: .watcher)
+                        self.lastRenewAt = Date()
+                        notify("Credential renewed", "The token was about to expire — pulled a fresh one.", kind: .watcher)
                     }
                 }
-                // login spawns a detached watcher that writes state shortly after
+                // The CLI writes state.json/the Keychain as login finishes up.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.refresh() }
             }
         }
@@ -2072,7 +2206,7 @@ final class StatusStore: ObservableObject {
         if FileManager.default.fileExists(atPath: logPath) {
             NSWorkspace.shared.open(URL(fileURLWithPath: logPath))
         } else {
-            lastError = "No log yet — log in first to start the watcher."
+            lastError = "No log yet — only CLI countdown sessions write one."
         }
     }
 }
@@ -2207,7 +2341,7 @@ struct ContentView: View {
             Button("Logout", role: .destructive) { store.logout() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This stops the watcher and removes the Claude Code credential from your Keychain.")
+            Text("This stops auto-renew and removes the Claude Code credential from your Keychain.")
         }
     }
 
@@ -2465,7 +2599,7 @@ struct ContentView: View {
 
     private var systemTab: some View {
         VStack(spacing: 8) {
-            watcherCard
+            renewCard
             healthCard
         }
         .padding(.horizontal, 12)
@@ -2478,15 +2612,15 @@ struct ContentView: View {
             LidClosedRow(store: store)
             SettingToggle(
                 icon: "eye.fill", tint: .indigo,
-                title: "Auto-awake with watcher",
-                subtitle: "Stay awake while the watcher runs",
+                title: "Auto-awake while signed in",
+                subtitle: "Stay awake so the token can be renewed",
                 isOn: Binding(get: { store.autoAwakeWithWatcher },
                               set: { store.setAutoAwakeWithWatcher($0) }))
             SettingToggle(
                 icon: "arrow.triangle.2.circlepath", tint: .green,
-                title: "Auto-restart watcher",
-                subtitle: "Log back in if the watcher dies",
-                isOn: Binding(get: { store.autoRestart }, set: { store.setAutoRestart($0) }))
+                title: "Auto-renew credential",
+                subtitle: "Pull a fresh token before this one expires",
+                isOn: Binding(get: { store.autoRenew }, set: { store.setAutoRenew($0) }))
             SettingToggle(
                 icon: "arrow.down.circle.fill", tint: .orange,
                 title: "Auto-update CLI",
@@ -2884,14 +3018,26 @@ struct ContentView: View {
         }
     }
 
-    private var watcherCard: some View {
-        Card(title: "Watcher", icon: "eye.fill") {
+    /// How the credential is being kept current: by this app on a timer, by a
+    /// CLI countdown the user has open in a terminal, or not at all.
+    private var renewCard: some View {
+        Card(title: "Auto-renew", icon: "arrow.clockwise") {
             InfoRow(
-                icon: s.watcherRunning ? "checkmark.circle.fill" : "xmark.circle.fill",
-                label: "Status",
-                value: s.watcherRunning ? "Running · pid \(s.watcherPid ?? 0)" : "Stopped",
-                valueColor: s.watcherRunning ? .green : .red
+                icon: renewIcon, label: "Status",
+                value: renewStatusText, valueColor: renewColor
             )
+            if s.countdownRunning {
+                InfoRow(icon: "terminal.fill", label: "Countdown",
+                        value: "pid \(s.countdownPid ?? 0)", valueColor: .secondary)
+            } else if let next = store.nextRenewAt {
+                InfoRow(icon: "clock", label: "Next renew",
+                        value: next <= Date() ? "due now" : shortTime(next),
+                        valueColor: .secondary)
+            }
+            if let last = store.lastRenewAt {
+                InfoRow(icon: "checkmark.circle", label: "Last renew",
+                        value: shortTime(last), valueColor: .secondary)
+            }
             if let log = s.lastLogLine {
                 Text(log)
                     .font(.caption2.monospaced())
@@ -2901,6 +3047,27 @@ struct ContentView: View {
                     .help(log)
             }
         }
+    }
+
+    private var renewIcon: String {
+        if s.countdownRunning { return "terminal.fill" }
+        return store.autoRenew ? "checkmark.circle.fill" : "pause.circle.fill"
+    }
+
+    private var renewColor: Color {
+        if s.countdownRunning { return .green }
+        return store.autoRenew ? .green : .orange
+    }
+
+    private var renewStatusText: String {
+        if s.countdownRunning { return "CLI countdown running" }
+        return store.autoRenew ? "On · handled by this app" : "Off"
+    }
+
+    private func shortTime(_ d: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f.string(from: d)
     }
 
     // MARK: Actions
@@ -2941,7 +3108,7 @@ struct ContentView: View {
                 Text("CLI update required")
                     .font(.callout.weight(.semibold))
             }
-            Text("auto-agent-ai is blocked until it's updated — login, push, Figma and the watcher won't work until you update.")
+            Text("auto-agent-ai is blocked until it's updated — login, push, Figma and auto-renew won't work until you update.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -3475,7 +3642,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
 
         store.$status.combineLatest(store.$busy, store.$keepAwake, store.$autoAwakeWithWatcher)
-            .combineLatest(store.$planUsage)
+            .combineLatest(store.$planUsage, store.$autoRenew)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.updateIcon() }
             .store(in: &bag)
@@ -3504,8 +3671,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if store.busy == nil, let exp = store.status.expiresAt {
             let secs = exp.timeIntervalSinceNow
             if secs <= 0 {
-                // While the watcher is renewing, the warning icon alone is enough
-                if !store.status.watcherRunning { parts.append("expired") }
+                // While a renewal is on its way, the warning icon alone is enough
+                if !store.autoRenew && !store.status.countdownRunning { parts.append("expired") }
             } else {
                 let h = Int(secs) / 3600
                 let m = (Int(secs) % 3600) / 60

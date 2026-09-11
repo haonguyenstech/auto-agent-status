@@ -8,7 +8,7 @@ credential status at a glance, without ever opening a terminal.
 - 🔑 **Menu bar status** — icon + live token countdown (`2h 15m`), turns to a
   warning when something is wrong
 - 📋 **Status panel** — credential (role, token expiry), today's Claude Code
-  token usage (same numbers as the CLI), watcher state, server health
+  token usage (same numbers as the CLI), auto-renew state, server health
 - 🖱 **One-click actions** — Login / Logout, plus **Push credential** for the
   primary user (owner), mirroring the CLI menu
 - 👥 **Session info** — which AI session this Mac pulls from and who else is on
@@ -21,9 +21,9 @@ credential status at a glance, without ever opening a terminal.
   exactly like the CLI. Owners also get Share / Revoke / Switch token
 - 🔐 **Microsoft sign-in** — opens your browser for OAuth and shows the sign-in
   link (with Open / Copy) as a fallback if the browser doesn't pop up
-- 🔔 **Notifications** — watcher stopped, credential wiped, token expired,
+- 🔔 **Notifications** — credential renewed, credential wiped, token expired,
   sign-in required, Figma session imported, back to normal
-- 🔄 **Self-healing** — if the watcher dies, the app logs in again
+- 🔄 **Auto-renew** — pulls a fresh credential ~10 min before the token expires
   automatically with your last role (toggleable)
 - ⬆️ **Auto-updates** — the app updates itself from this repo's Releases
   ("Update App" button), and offers to update the CLI when a new version ships.
