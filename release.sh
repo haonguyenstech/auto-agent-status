@@ -6,18 +6,18 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-REPO="haonguyenstech/autoagent-status"
+REPO="haonguyenstech/auto-agent-status"
 
 ./package.sh
 VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" Info.plist)
-ZIP="dist/AutoAgent-Status-$VERSION.zip"
+ZIP="dist/Auto-Agent-Status-$VERSION.zip"
 
 echo ""
 echo "Releasing v$VERSION to github.com/$REPO …"
 gh release create "v$VERSION" "$ZIP" \
   --repo "$REPO" \
   --title "v$VERSION" \
-  --notes "AutoAgent Status v$VERSION — menu bar app for auto-agent-ai." \
+  --notes "Auto Agent Status v$VERSION — menu bar app for auto-agent-ai." \
   || { echo "Release v$VERSION may already exist. Bump the version in Info.plist first."; exit 1; }
 
 echo "✅ Released: https://github.com/$REPO/releases/tag/v$VERSION"

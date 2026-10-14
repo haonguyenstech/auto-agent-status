@@ -15,7 +15,7 @@ unset TOKEN
 
 CODE=$(curl -s -o /dev/null -w "%{http_code}" \
   -H "Authorization: Bearer $(cat .update-token)" \
-  https://api.github.com/repos/haonguyenstech/autoagent-status/releases/latest)
+  https://api.github.com/repos/haonguyenstech/auto-agent-status/releases/latest)
 if [ "$CODE" != "200" ]; then
   echo "❌ Token check failed (HTTP $CODE). Token may be wrong or already revoked."
   exit 1

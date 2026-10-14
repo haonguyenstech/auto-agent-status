@@ -1,14 +1,14 @@
 #!/bin/bash
-# AutoAgent Status — public installer. Always installs the latest release.
+# Auto Agent Status — public installer. Always installs the latest release.
 #
-#   curl -fsSL https://raw.githubusercontent.com/haonguyenstech/autoagent-status/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/haonguyenstech/auto-agent-status/main/install.sh | bash
 #
 # Public repo, no token required. Run it again any time to update.
 set -e
 
-REPO="haonguyenstech/autoagent-status"
+REPO="haonguyenstech/auto-agent-status"
 API="https://api.github.com/repos/$REPO/releases/latest"
-APP="AutoAgent Status.app"
+APP="Auto Agent Status.app"
 DEST="$HOME/Applications"
 
 echo "==> Looking up the latest version…"
@@ -24,13 +24,14 @@ TMP=$(mktemp -d)
 echo "==> Downloading…"
 /usr/bin/curl -fsSL -o "$TMP/app.zip" "$ZIPURL"
 /usr/bin/ditto -x -k "$TMP/app.zip" "$TMP/x"
-SRC=$(/usr/bin/find "$TMP/x" -maxdepth 4 -name "$APP" | head -1)
+SRC=$(/usr/bin/find "$TMP/x" -maxdepth 2 -name "$APP" | head -1)
+[ -n "$SRC" ] || SRC=$(/usr/bin/find "$TMP/x" -maxdepth 4 -name "AutoAgent Status.app" | head -1) # releases before 1.18
 [ -n "$SRC" ] || { echo "❌ '$APP' not found inside the download"; exit 1; }
 
 echo "==> Installing to $DEST …"
 mkdir -p "$DEST"
 pkill -x AutoAgentStatus 2>/dev/null || true
-rm -rf "$DEST/$APP"
+rm -rf "$DEST/$APP" "$DEST/AutoAgent Status.app" # + the pre-1.18 name
 /usr/bin/ditto "$SRC" "$DEST/$APP"
 # Strip the Gatekeeper quarantine flag so the app opens without warnings.
 /usr/bin/xattr -dr com.apple.quarantine "$DEST/$APP" 2>/dev/null || true

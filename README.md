@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="docs/icon.png" width="112" alt="AutoAgent Status icon" />
+<img src="docs/icon.png" width="112" alt="Auto Agent Status icon" />
 
-# AutoAgent Status
+# Auto Agent Status
 
 **Your shared Claude Code credential, at a glance in the menu bar.**
 
@@ -10,7 +10,7 @@ A native macOS menu bar app for the `auto-agent-ai` CLI. It shows whether this M
 tracks plan limits and token usage, and handles the shared Figma login, without ever opening a terminal.
 
 <p>
-  <a href="../../releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/haonguyenstech/autoagent-status?color=34C759&logo=github" /></a>
+  <a href="../../releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/haonguyenstech/auto-agent-status?color=34C759&logo=github" /></a>
   <img alt="macOS 13+" src="https://img.shields.io/badge/macOS-13%2B-000000?logo=apple&logoColor=white" />
   <img alt="Universal" src="https://img.shields.io/badge/binary-universal%20(arm64%20%2B%20x86__64)-6E7781" />
   <img alt="Swift" src="https://img.shields.io/badge/Swift-SwiftUI%20%2B%20AppKit-F05138?logo=swift&logoColor=white" />
@@ -86,7 +86,7 @@ The app updates from this repo's Releases ("Update App"), and updates the CLI wh
 Open Terminal and run:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/haonguyenstech/autoagent-status/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/haonguyenstech/auto-agent-status/main/install.sh | bash
 ```
 
 It downloads the latest release, removes the Gatekeeper quarantine flag and launches the app. Run it again any time to update.
@@ -94,7 +94,7 @@ It downloads the latest release, removes the Gatekeeper quarantine flag and laun
 <details>
 <summary><b>Manual install</b></summary>
 
-Download the latest `AutoAgent-Status-x.y.z.zip` from [Releases](../../releases), unzip, then run:
+Download the latest `Auto-Agent-Status-x.y.z.zip` from [Releases](../../releases), unzip, then run:
 
 ```bash
 bash Install.command
@@ -110,7 +110,7 @@ Nothing to do. The app checks this repo's Releases every 6 hours (or right away 
 
 ### Uninstall
 
-Quit the app (power button in the panel footer), then delete `~/Applications/AutoAgent Status.app`. To also remove the credential sync:
+Quit the app (power button in the panel footer), then delete `~/Applications/Auto Agent Status.app` (before v1.18: `AutoAgent Status.app`). To also remove the credential sync:
 `auto-agent-ai logout && npm uninstall -g @saigontechnology/auto-agent`.
 
 ---
@@ -183,7 +183,7 @@ Click the key icon in the menu bar → **Status** → **Login**. Your browser op
 
 ```mermaid
 flowchart LR
-    APP[AutoAgent Status<br/>menu bar] -->|login · push · logout · figma| CLI[auto-agent-ai CLI]
+    APP[Auto Agent Status<br/>menu bar] -->|login · push · logout · figma| CLI[auto-agent-ai CLI]
     CLI -->|shared credential| KC[(macOS Keychain<br/>Claude Code-credentials)]
     APP -->|reads expiry| KC
     APP -->|sessions · version gate · auth refresh| SRV[(auto-agent server)]
@@ -204,7 +204,7 @@ flowchart LR
 Swift in a single file (`Sources/main.swift`), built with `swiftc`, no Xcode project.
 
 ```bash
-./build.sh        # universal build → ~/Applications/AutoAgent Status.app
+./build.sh        # universal build → ~/Applications/Auto Agent Status.app
 ./snapshot.sh     # README screenshots → docs/snapshots/ (made-up data, light + dark)
 ```
 
@@ -220,7 +220,7 @@ gh auth switch --user haonguyenstech
 ./release.sh
 ```
 
-`release.sh` builds the universal binary, packages `dist/AutoAgent-Status-<ver>.zip` and creates the GitHub Release. New users install with the public one-liner (`install.sh`); existing apps update themselves from Releases.
+`release.sh` builds the universal binary, packages `dist/Auto-Agent-Status-<ver>.zip` and creates the GitHub Release. New users install with the public one-liner (`install.sh`); existing apps update themselves from Releases.
 
 ---
 

@@ -21,8 +21,11 @@ let keychainService = "Claude Code-credentials"
 /// that a healthy token is left alone.
 let renewLeadSeconds: TimeInterval = 10 * 60
 let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
-let updateRepo = "haonguyenstech/autoagent-status" // private repo with release zips
-let installedAppPath = "\(home)/Applications/AutoAgent Status.app"
+let updateRepo = "haonguyenstech/auto-agent-status" // public repo with release zips
+let installedAppPath = "\(home)/Applications/Auto Agent Status.app"
+/// Where v1.17.0 and older lived. Their updater installs here, so the new app
+/// moves itself out on first launch (`migrateLegacyBundle`).
+let legacyAppPath = "\(home)/Applications/AutoAgent Status.app"
 
 /// Read-only fine-grained PAT (Contents: read on the update repo only),
 /// injected at build time from .update-token — see build.sh. Nil when absent.
@@ -1626,7 +1629,7 @@ final class StatusStore: ObservableObject {
     /// Drive the power assertion from the combined desired state (manual + auto).
     private func syncSleepGuard() {
         if isStayingAwake {
-            sleepGuard.start(reason: "AutoAgent: keep Mac awake")
+            sleepGuard.start(reason: "Auto Agent: keep Mac awake")
         } else {
             sleepGuard.stop()
         }
@@ -1911,7 +1914,7 @@ final class StatusStore: ObservableObject {
                     self.appDownloadURL = appRelease.zipURL
                     if isNewer(appRelease.version, than: appVersion) {
                         notify("App update available",
-                               "AutoAgent Status v\(appRelease.version) is available — click Update App in the panel.",
+                               "Auto Agent Status v\(appRelease.version) is available — click Update App in the panel.",
                                kind: .updates)
                     }
                 }
@@ -1994,7 +1997,7 @@ final class StatusStore: ObservableObject {
             notify("Token expired", "The token expired and auto-renew is off — log in to refresh it.", kind: .credential)
         }
         if old.state != .active && new.state == .active {
-            notify("AutoAgent active", "Credential synced and up to date.", kind: .credential)
+            notify("Auto Agent active", "Credential synced and up to date.", kind: .credential)
         }
     }
 
@@ -2242,7 +2245,7 @@ final class StatusStore: ObservableObject {
                     abortedForAuth = true
                     DispatchQueue.main.async {
                         notify("Sign-in required",
-                               "Auto-renew needs you to sign in again — open AutoAgent and click Owner or Client Login.",
+                               "Auto-renew needs you to sign in again — open Auto Agent and click Owner or Client Login.",
                                kind: .signIn)
                     }
                     return true // abort the hung process
@@ -2310,9 +2313,10 @@ final class StatusStore: ObservableObject {
         TMP=$(mktemp -d)
         /usr/bin/curl -fsSL -H 'Accept: application/octet-stream' \(auth) -o "$TMP/app.zip" '\(dl)'
         /usr/bin/ditto -x -k "$TMP/app.zip" "$TMP/x"
-        SRC=$(/usr/bin/find "$TMP/x" -maxdepth 4 -name "AutoAgent Status.app" | head -1)
+        SRC=$(/usr/bin/find "$TMP/x" -maxdepth 2 -name "Auto Agent Status.app" | head -1)
+        [ -n "$SRC" ] || SRC=$(/usr/bin/find "$TMP/x" -maxdepth 4 -name "AutoAgent Status.app" | head -1)
         test -n "$SRC"
-        rm -rf '\(installedAppPath)'
+        rm -rf '\(installedAppPath)' '\(legacyAppPath)'
         /usr/bin/ditto "$SRC" '\(installedAppPath)'
         /usr/bin/xattr -dr com.apple.quarantine '\(installedAppPath)' 2>/dev/null || true
         rm -rf "$TMP"
@@ -2325,7 +2329,7 @@ final class StatusStore: ObservableObject {
                     self.lastError = "App update failed:\n" + String(stripANSI(r.output).suffix(400))
                     return
                 }
-                notify("App updated", "Restarting AutoAgent Status…", kind: .updates)
+                notify("App updated", "Restarting Auto Agent Status…", kind: .updates)
                 let relauncher = Process()
                 relauncher.executableURL = URL(fileURLWithPath: "/bin/bash")
                 relauncher.arguments = ["-c", "sleep 1; /usr/bin/open '\(installedAppPath)'"]
@@ -2485,7 +2489,7 @@ struct ContentView: View {
         }
         .frame(width: 340)
         .confirmationDialog(
-            "Log out of AutoAgent?",
+            "Log out of Auto Agent?",
             isPresented: $confirmLogout,
             titleVisibility: .visible
         ) {
@@ -2863,7 +2867,7 @@ struct ContentView: View {
             }
             footerButton("doc.text", help: "Open watch log") { store.openLog() }
             Spacer()
-            footerButton("power", help: "Quit AutoAgent Status") { NSApp.terminate(nil) }
+            footerButton("power", help: "Quit Auto Agent Status") { NSApp.terminate(nil) }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -2886,7 +2890,7 @@ struct ContentView: View {
             }
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 5) {
-                    Text("AutoAgent")
+                    Text("Auto Agent")
                         .font(.system(.title3, design: .rounded).weight(.bold))
                     Text("v" + appVersion)
                         .font(.caption2.monospacedDigit())
@@ -3689,7 +3693,7 @@ struct AboutSection: View {
     @State private var hearts: [FloatingHeart] = []
 
     private let profile = URL(string: "https://github.com/haonguyenstech")!
-    private let repo = URL(string: "https://github.com/haonguyenstech/autoagent-status")!
+    private let repo = URL(string: "https://github.com/haonguyenstech/auto-agent-status")!
 
     private func metaRow(_ icon: String, _ label: String, _ value: String, mono: Bool = true) -> some View {
         HStack(spacing: 8) {
@@ -3721,7 +3725,7 @@ struct AboutSection: View {
                 .frame(width: 40, height: 40)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Hao Nguyen").font(.callout.weight(.semibold))
-                    Text("Creator of AutoAgent Status").font(.caption2).foregroundStyle(.secondary)
+                    Text("Creator of Auto Agent Status").font(.caption2).foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 8)
                 Button { NSWorkspace.shared.open(profile) } label: {
@@ -3740,7 +3744,7 @@ struct AboutSection: View {
                 Divider().opacity(0.4)
                 metaRow("terminal.fill", "Built on",
                         "auto-agent-ai " + (store.installedVersion.map { "v\($0)" } ?? "—"))
-                metaRow("macwindow", "This app", "AutoAgent Status v\(appVersion)")
+                metaRow("macwindow", "This app", "Auto Agent Status v\(appVersion)")
                 if let role = store.status.role {
                     metaRow("person.fill", "Signed in as",
                             role.capitalized + (store.status.username.map { " · \($0)" } ?? ""), mono: false)
@@ -3914,7 +3918,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .map { "\($0.label) \(Int($0.percent.rounded()))%" }
                 .joined(separator: ", ")
         }
-        button.toolTip = "AutoAgent — \(desc)\(usageNote)\(awakeNote)"
+        button.toolTip = "Auto Agent — \(desc)\(usageNote)\(awakeNote)"
     }
 
     @objc private func togglePopover() {
@@ -3940,9 +3944,41 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
 
 // MARK: - Entry point
 
+/// v1.18.0 renamed the bundle "AutoAgent Status.app" → "Auto Agent Status.app".
+/// Older updaters install the new build under the old name; move it to the new
+/// one and relaunch. Returns true when this process should exit.
+func migrateLegacyBundle() -> Bool {
+    let fm = FileManager.default
+    guard Bundle.main.bundlePath == legacyAppPath else { return false }
+    do {
+        if fm.fileExists(atPath: installedAppPath) { try fm.removeItem(atPath: installedAppPath) }
+        try fm.moveItem(atPath: legacyAppPath, toPath: installedAppPath)
+    } catch {
+        return false // keep running from the old place rather than not at all
+    }
+    // The login item points at the old path; re-register it from the new one.
+    if SMAppService.mainApp.status == .enabled {
+        UserDefaults.standard.set(true, forKey: "reregisterLoginItem")
+    }
+    let relauncher = Process()
+    relauncher.executableURL = URL(fileURLWithPath: "/bin/bash")
+    relauncher.arguments = ["-c", "sleep 1; /usr/bin/open '\(installedAppPath)'"]
+    try? relauncher.run()
+    return true
+}
+
+func reregisterLoginItemIfNeeded() {
+    guard UserDefaults.standard.bool(forKey: "reregisterLoginItem") else { return }
+    UserDefaults.standard.removeObject(forKey: "reregisterLoginItem")
+    try? SMAppService.mainApp.unregister()
+    try? SMAppService.mainApp.register()
+}
+
 #if SNAPSHOT
 runSnapshots() // README screenshots with made-up data: ./snapshot.sh
 #else
+if migrateLegacyBundle() { exit(0) }
+reregisterLoginItemIfNeeded()
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate

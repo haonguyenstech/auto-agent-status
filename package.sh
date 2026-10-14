@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build a shareable zip: dist/AutoAgent-Status-<version>.zip
+# Build a shareable zip: dist/Auto-Agent-Status-<version>.zip
 # Contains the app + double-clickable installer + README for teammates.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -7,20 +7,25 @@ cd "$(dirname "$0")"
 ./build.sh
 
 VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" Info.plist)
-APP="$HOME/Applications/AutoAgent Status.app"
-STAGE="dist/AutoAgent Status $VERSION"
-ZIP="dist/AutoAgent-Status-$VERSION.zip"
+APP="$HOME/Applications/Auto Agent Status.app"
+STAGE="dist/Auto Agent Status $VERSION"
+ZIP="dist/Auto-Agent-Status-$VERSION.zip"
 
 rm -rf dist
 mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/"
+# Apps up to v1.17.0 update themselves by looking for "AutoAgent Status.app" in
+# the zip, so ship a copy under that name too, hidden. The new build moves itself
+# to the new name on first launch.
+mkdir -p "$STAGE/.legacy"
+cp -R "$APP" "$STAGE/.legacy/AutoAgent Status.app"
 
 cat > "$STAGE/Install.command" <<'EOF'
 #!/bin/bash
-# AutoAgent Status installer — run with:  bash Install.command
+# Auto Agent Status installer — run with:  bash Install.command
 set -e
 cd "$(dirname "$0")"
-APP="AutoAgent Status.app"
+APP="Auto Agent Status.app"
 DEST="$HOME/Applications"
 PKG="@saigontechnology/auto-agent"
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
@@ -28,7 +33,7 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 echo "==> Installing $APP to $DEST …"
 mkdir -p "$DEST"
 pkill -x AutoAgentStatus 2>/dev/null || true
-rm -rf "$DEST/$APP"
+rm -rf "$DEST/$APP" "$DEST/AutoAgent Status.app" # + the pre-1.18 name
 cp -R "$APP" "$DEST/"
 # Remove the quarantine flag Gatekeeper puts on downloaded apps
 xattr -dr com.apple.quarantine "$DEST/$APP" 2>/dev/null || true
@@ -93,8 +98,8 @@ EOF
 chmod +x "$STAGE/Install.command"
 
 cat > "$STAGE/README.txt" <<'EOF'
-AutoAgent Status — menu bar app for the auto-agent-ai CLI
-==========================================================
+Auto Agent Status — menu bar app for the auto-agent-ai CLI
+===========================================================
 
 WHAT IT DOES
   Lives in your macOS menu bar and shows the status of your shared
@@ -131,7 +136,7 @@ IF YOU SEE "Apple could not verify … free of malware"
 
 UNINSTALL
   Quit the app from its panel (power button), then delete
-  ~/Applications/AutoAgent Status.app
+  ~/Applications/Auto Agent Status.app
 EOF
 
 ditto -c -k --sequesterRsrc --keepParent "$STAGE" "$ZIP"

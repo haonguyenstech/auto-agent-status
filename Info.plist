@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>AutoAgent Status</string>
+	<string>Auto Agent Status</string>
 	<key>CFBundleExecutable</key>
 	<string>AutoAgentStatus</string>
 	<key>CFBundleIconFile</key>
@@ -11,7 +11,7 @@
 	<key>CFBundleIdentifier</key>
 	<string>vn.saigontechnology.autoagent-status</string>
 	<key>CFBundleName</key>
-	<string>AutoAgent Status</string>
+	<string>Auto Agent Status</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

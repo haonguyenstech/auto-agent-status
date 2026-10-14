@@ -1,9 +1,9 @@
 #!/bin/bash
-# Build and install AutoAgent Status.app into ~/Applications
+# Build and install Auto Agent Status.app into ~/Applications
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP_NAME="AutoAgent Status"
+APP_NAME="Auto Agent Status"
 BUNDLE="$HOME/Applications/$APP_NAME.app"
 
 mkdir -p build "$HOME/Applications"
@@ -39,7 +39,7 @@ if [ ! -f AppIcon.icns ]; then
 fi
 
 echo "Bundling…"
-rm -rf "$BUNDLE"
+rm -rf "$BUNDLE" "$HOME/Applications/AutoAgent Status.app" # + the pre-1.18 name
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
 cp Info.plist "$BUNDLE/Contents/Info.plist"
 cp build/AutoAgentStatus "$BUNDLE/Contents/MacOS/AutoAgentStatus"
