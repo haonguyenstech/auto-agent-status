@@ -2446,10 +2446,15 @@ struct ContentView: View {
     @State private var confirmLogout = false
     @State private var confirmFigmaClear = false
     @State private var switchingToken = false
-    @State private var tab: Tab = .status
+    @State private var tab: Tab
     @State private var notifExpanded = false
 
     enum Tab: Hashable { case status, figma, system, settings }
+
+    init(store: StatusStore, tab: Tab = .status) {
+        self.store = store
+        _tab = State(initialValue: tab)
+    }
 
     private static let relFormatter = RelativeDateTimeFormatter()
     private static let absFormatter: DateFormatter = {
@@ -2533,8 +2538,10 @@ struct ContentView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .onAppear {
+            #if !SNAPSHOT
             store.refreshFigma()
             store.refreshSessions()
+            #endif
         }
         .confirmationDialog(
             "Sign out of the shared Figma account?",
@@ -3647,11 +3654,18 @@ struct SettingToggle: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 8)
+            #if SNAPSHOT
+            // An offscreen window can't be key, so a real switch renders grey; draw what it looks like.
+            Capsule().fill(isOn ? tint : Color.secondary.opacity(0.25))
+                .frame(width: 32, height: 18)
+                .overlay(Circle().fill(.white).shadow(radius: 0.6).padding(2), alignment: isOn ? .trailing : .leading)
+            #else
             Toggle("", isOn: $isOn)
                 .labelsHidden()
                 .toggleStyle(.switch)
                 .controlSize(.small)
                 .tint(tint)
+            #endif
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
@@ -3926,8 +3940,12 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
 
 // MARK: - Entry point
 
+#if SNAPSHOT
+runSnapshots() // README screenshots with made-up data: ./snapshot.sh
+#else
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
 app.run()
+#endif
